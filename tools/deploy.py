@@ -283,9 +283,9 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False) -> int:
     print("    3. 看日志（F4SE 日志目录）：")
     print(f"       Get-Content \"$([Environment]::GetFolderPath('MyDocuments'))\\My Games\\Fallout4\\F4SE\\F4LoadText.log\"")
     print("         应有 3 行 `hook ok`（LoadFullNameChunk / Load(2194235) / Load2(2194240)）")
-    print("         + 1 行 `hook 延后`（GetDescription(2193019)，由 kGameDataReady 装）")
-    print("         读档完成时：`DESC 映射: 全表单扫描=… 带 TESDescription 组件=…`")
-    print("         以及一行汇总：`replace: 读盘期字段 忽略传入=… （其中自取基表=…）`")
+    print("         + 1 行 `hook defer`（GetDescription(2193019)，由 kGameDataReady 装）")
+    print("         读档完成时：`DESC map: scanned-forms=…  with-TESDescription=…`")
+    print("         以及一行汇总：`replace: load-time fields  incoming-dropped=… (of which from base=…)  translated=…`")
     print("       日志开关都在 ini（信息 / 审计上限 / 审计签名 / 高级）—— 改**仓内模板**再部署。")
     return 0
 
