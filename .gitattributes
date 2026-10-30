@@ -1,0 +1,39 @@
+# 全部强制 LF —— 与编辑器无关，仓库与检出都是 LF。
+#
+# 为什么不写作 `-text`：`-text` 是"不做任何换行转换"，文件会原样保存磁盘上的
+# CRLF，反而不保证 LF。要"一律 LF"必须写 `text eol=lf`（text 表示按文本处理，
+# eol=lf 表示检出时也用 LF）。
+* text=auto eol=lf
+
+# 二进制类型不参与换行处理（显式声明，避免被误判成文本）。
+*.dll   binary
+*.esp   binary
+*.esm   binary
+*.esl   binary
+*.bsa   binary
+*.ba2   binary
+*.png   binary
+*.jpg   binary
+*.cache binary
+
+# 源码 / 配置 / 脚本 / 译文：强制 LF。
+# 源码与 ini 里有大量多字节中文字面量与注释，统一 LF 可避免"某编辑器改一次
+# 就整文件 diff"这类噪音。
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.c     text eol=lf
+*.ini   text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.tsv   text eol=lf
+*.ps1   text eol=lf
+*.bat   text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+CMakePresets.json text eol=lf
+.gitignore   text eol=lf
+.gitattributes text eol=lf

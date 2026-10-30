@@ -1,0 +1,83 @@
+#pragma once
+
+#include <cstdint>
+
+namespace RE
+{
+	class BGSLocalizedString;
+}
+#include <string>
+#include <string_view>
+
+namespace RE
+{
+	class TESFile;
+}
+
+// 节点 2：按类别把文本统一替换（默认关闭，靠 F4LoadText.ini 打开）。
+namespace Replace
+{
+	struct Stats
+	{
+		std::uint64_t fieldIgnored{ 0 };   // 「忽略文本传入」数（保住基底文本）
+		std::uint64_t fieldFromBase{ 0 };  // 其中靠"自取基表文本"救回来的（引擎没读基表那份）
+		std::uint64_t fieldTranslated{ 0 };  // 靠 yaml 译文写回的（`[汉化]`，见 Translation.h）
+	};
+
+	void             Init();                                  // Config::Load 之后调用
+	bool             Enabled();
+	// 读盘期 FULL 钩子用：只有 TESFullName*，分类靠「正在读的那条记录的签名」
+	// ── 加载器钩子专用：忽略文本传入 ──────────────────────────────────
+	// 名单外的文本一律走引擎原逻辑（返回 false 表示不碰）。
+	// 命中名单时：写回「基表那份」（a_previous，或记住的那份）。
+	// a_previous = 调原函数**之前**的字段值；a_ownerRead = 这次读的就是归属插件自己（不是覆盖）。
+	// a_plugin = 归属（拥有者）插件；a_readerListed = **正在读它的那个插件**在不在名单里。
+	// 规则：读取者在名单里 → 采用它读进来的文本；否则按归属判定（忽略传入）。
+	[[nodiscard]] bool HandleFullNameField(RE::TESFullName& a_field, const RE::TESFile* a_file,
+		std::uint32_t a_formCode, std::string_view a_plugin, std::uint32_t a_rawID, std::string_view a_previous,
+		std::string_view a_loaded, bool a_ownerRead, bool a_readerListed);
+	[[nodiscard]] bool HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TESFile* a_file,
+		std::uint32_t a_formCode, std::string_view a_plugin, std::uint32_t a_rawID, std::string_view a_previous,
+		std::string_view a_loaded, bool a_ownerRead, bool a_readerListed);
+
+	// 逐条审计（文本日志）：仅**真改动**时打（a_read != a_kept）。
+	// 上限由 ini 的 [调试] 审计上限 控制（0 = 关，默认 300）。
+	//   [读它的插件] 签名 formID 偏移 实际文本  →  [归属插件] 基表/译文  →  回写为 …
+	//
+	// ⚠️ 不再收 `a_read` / `a_written` / `a_formCode`（2026-10 收敛）：
+	//   * 三个调用点原本都传同一个值（`dest, dest` / `keep, keep`）⇒ 打出来永远是
+	//     “文本='X' → 回写为 'X'”，白占两个参数；真正写进去的就是 a_kept。
+	//   * `a_formCode` 与 `a_file->currentform.form` 是**同一件事的两份来源**，一旦不同源
+	//     就会打出“签名 formID 对不上”的假线索 —— 日志的可信度是项目硬纪律，所以只留一份：
+	//     **签名与 formID 一律从 a_file 取**。
+	void LogAudit(const char* a_leg, const RE::TESFile* a_file, std::string_view a_owner,
+		std::uint32_t a_rawID, std::string_view a_read, std::string_view a_kept);
+
+	// 记住「名单内插件自己读进来的文本」：覆盖记录（尤其压缩记录）读进来时字段往往已被清空，
+	// 这时要写回的不是"读前那份"（空的 ✗），而是**基表那份**。
+	// 记忆的键 = **(归属插件, 低位ID, chunk 4CC, 同 chunk 内序号)** ——
+	//   为什么不用字段地址 ✗：引擎解析子记录用的是**会复用的临时对象**，
+	//   同一记录里不同字段的地址会撞车（实测：ARMO 的 "Default"/"Light" 被塞进了 FULL 的中文名 ✗）。
+	//   序号必须**按读取文件分开计**（否则基表与覆盖两次读取会串号）✓
+	void RememberOwnText(std::uint32_t a_chunkID, std::string_view a_text, std::string_view a_plugin,
+		std::uint32_t a_rawID, const RE::TESFile* a_file);
+	// 取回“基表那份”。
+	//   a_file   = **正在读的那个文件**（序号按它分开计，必传）
+	//   a_seqOut = 出参：本次读取的序号（-1 = 超限）。
+	//      ⚠️ seq **不是“数组下标”**：它是“这个 chunk 在本次读取里第几次出现”，
+	//      而引擎会把同一个单值字段（实测 `FULL`）重复读很多次。别拿它做数组长度校验。
+	[[nodiscard]] std::string_view RememberedOwnText(std::uint32_t a_chunkID, std::string_view a_plugin,
+		std::uint32_t a_rawID, const RE::TESFile* a_file, int* a_seqOut = nullptr);
+
+	// 这条记录是否在名单里（不看类别值，只看 [名单]）
+	[[nodiscard]] bool IsListed(std::string_view a_plugin, std::uint32_t a_rawID);
+	Stats            Snapshot();
+
+	// 归属判定（读盘期专用）：按**本文件自己的主文件表**判，不要拿记录头里的高位去查全局编译索引表 ——
+	// 那个高位是「作者当年的索引」，会跟运行时索引撞车。
+	//   实测（2026-10-07，xEdit 复核）：IntegratedAutomatron.esp（5 个主文件）的自有记录在盘上是
+	//   0x05000B51，游戏里编译索引 5 = DLCworkshop02.esm → 被当成「官方记录的覆盖」而误改。
+	// 返回 false 表示归属不可信（此时一个字都不写）。
+	[[nodiscard]] bool PluginAndRawIDOf(const RE::TESFile* a_file, std::uint32_t a_formID,
+		std::string_view& a_plugin, std::uint32_t& a_rawID);
+}

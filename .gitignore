@@ -1,0 +1,76 @@
+# 构建产物
+build/
+
+# vcpkg 依赖树（版本由 vcpkg.json 的 builtin-baseline 锁定）
+vcpkg_installed/
+build/vcpkg_installed/
+
+# 第三方上游库快照，不入本仓
+extern/
+
+# 探针日志（游戏运行时产物）
+*.probe.jsonl
+*.bin
+
+# 译文字典二进制缓存（运行时代产物：写在 mod 目录，万一被拷进仓也别入库）
+dictionary.cache
+dictionary.cache.tmp
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+.idea/
+__pycache__/
+Thumbs.db
+desktop.ini
+
+# AI 工具的本地配置（不进仓）
+.pi/
+
+# ── 以下内容**只在本地**，不进公开仓 ─────────────────────────────────────────
+#
+# 本仓对外只放「源码 + CI + 配置」（给别人 clone 后能自己编译）。
+# 以下属于**我自己在用的东西**，公开出去没意义：
+#
+#   1. 中文文档（AGENTS.md / docs\）—— 写给本机 AI 与自己的
+#      ⚠️ README.md **例外，是入库的**（公开仓的门面）。
+#   2. 译文（translations\）—— 5 MB，且属于「运行数据」而非源码
+#   3. 本机路径速查（LOCAL_PATHS.md）与本机配置（.f4lt_local.json）
+#   4. MO2 元数据（config/meta.ini）—— 主体是机器本地状态，见下
+#
+# ⚠️ 它们**仍在本地**，只是不跟踪。别把它们从磁盘上删了。
+#
+# ⚠️ tools\ **是入库的**（2026-10-19 改）：它们对外有用（部署 / esp<->yaml 导出回填）。
+#    为了能让它们入库，脚本里**不再硬编码任何本机路径**：
+#      取值顺序 = 命令行参数 > 环境变量（F4LT_MODS_DIR / F4LT_GAME_DATA_DIR /
+#                 F4LT_STRINGS_DIR）> .f4lt_local.json > 报错。见 tools/local_paths.py。
+AGENTS.md
+docs/
+translations/
+LOCAL_PATHS.md
+
+# MO2 元数据：modid / lastNexusQuery / tracked / validated / color / [installedFiles]
+# 这些是 **MO2 每次启动自己重写的机器本地状态**，入库只会制造无意义的 diff。
+# tools\deploy.py 对它是**可选**的：仓内有就拷、没有就跳过（不报错）。
+config/meta.ini
+
+# 本机配置（路径 + notes 备注，由 tools/local_paths.py 读取；每台机器各自一份）。
+# 模板 .f4lt_local.example.json **是入库的**（不含任何真实路径），照着复制即可。
+.f4lt_local.json
+
+# 临时/备用构建目录（正式目录是 build/，由 CMakePresets 的 default preset 指定）
+build*/
+
+# 临时脚本/输出（约定：临时东西都放这儿）
+tmp/
+_tmp/
+tmp_*/
+
+# 手边编译的单文件产物（如性能基准），别混进仓
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# 发布打包产物（tools\package_release.py / sanitize_translations.py 的产出）
+dist/

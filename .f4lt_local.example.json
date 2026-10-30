@@ -1,0 +1,12 @@
+{
+  "_comment": "F4LoadText 本机配置模板。复制为 .f4lt_local.json 再改成本机路径。.f4lt_local.json 已被 .gitignore 忽略，不会提交；本模板本身不含任何真实路径。",
+  "_readme": "顶层字符串键 = 机器可读路径（tools/local_paths.py 的 local_path / require_path）；notes = 本机专属自由备注（local_note / notes），脚本不解释内容；下划线开头的键一律被忽略。",
+  "mods_dir": "<MO2 mods 目录，例如 X:/MO2/mods>",
+  "game_data_dir": "<游戏 Data 目录，例如 X:/Steam/steamapps/common/Fallout 4/Data>",
+  "strings_dir": "<语言包 Strings 目录，例如 X:/MO2/mods/<汉化 mod>/Strings>",
+  "notes": {
+    "log_dir": "<F4SE 日志目录，例如 X:/Users/<you>/Documents/My Games/Fallout4/F4SE>",
+    "saves_dir": "<存档目录>",
+    "_comment": "free-form: 任何你想随本机一起记下来的东西，随便加键"
+  }
+}

@@ -1,0 +1,23 @@
+{
+	"version": 3,
+	"cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+	"configurePresets": [
+		{
+			"name": "default",
+			"displayName": "F4LoadText (VS2022 x64 / Release)",
+			"generator": "Visual Studio 17 2022",
+			"architecture": "x64",
+			"binaryDir": "${sourceDir}/build",
+			"cacheVariables": {
+				"CMAKE_CONFIGURATION_TYPES": "Release"
+			}
+		}
+	],
+	"buildPresets": [
+		{
+			"name": "release",
+			"configurePreset": "default",
+			"configuration": "Release"
+		}
+	]
+}

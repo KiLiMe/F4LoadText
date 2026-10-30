@@ -1,0 +1,228 @@
+name: build
+
+on:
+  push:
+    branches: [main, master, dev]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      commonlibf4_ref:
+        description: "CommonLibF4 分支 / tag / commit 供 CI 使用"
+        required: false
+        default: "main"
+        type: string
+      release:
+        description: "创建 GitHub Release（需填 version；留空则不发）"
+        required: false
+        default: false
+        type: boolean
+      version:
+        description: "发布版本号（如 v0.3.0）；仅当上项 release 为 true 时使用"
+        required: false
+        default: ""
+        type: string
+
+env:
+  # CommonLibF4 是 F4LoadText 的**源码依赖**（不发布 CMake 包，CI 里直接编源码）。
+  COMMONLIBF4_REF: ${{ github.event.inputs.commonlibf4_ref || 'main' }}
+  # 手动触发时的选项（push / PR 触发时取默认值）
+  DO_RELEASE: ${{ github.event.inputs.release || 'false' }}
+  RELEASE_VERSION: ${{ github.event.inputs.version || '' }}
+  # 依赖 triplet：本机开发用的就是它（对应 /MD，与游戏进程 CRT 一致）。
+  #   ⚠️ 不能用默认的 x64-windows（那是 /MD 动态 CRT 的**动态库**，与 MSVC_RUNTIME_LIBRARY
+  #      MultiThreadedDLL 的静态库用法混淆）；必须显式给 static-md。
+  VCPKG_TRIPLET: x64-windows-static-md
+
+# 默认 GITHUB_TOKEN 是只读的；发 Release 需要写权限。
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      # job 级 env 的表达式只支持 github/needs/strategy/matrix/vars/secrets/inputs，
+      # 不能引用 runner.* 或 env.* ⇒ VCPKG_ROOT / VCPKG_BINARY_SOURCES 在下方步骤里写 $GITHUB_ENV。
+      COMMONLIBF4_DIR: ${{ github.workspace }}/../CommonLibF4
+
+    steps:
+      - name: Checkout F4LoadText
+        uses: actions/checkout@v7
+
+      - name: Set up MSBuild (Visual Studio 2022)
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Cache CommonLibF4
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.COMMONLIBF4_DIR }}
+          key: commonlibf4-${{ runner.os }}-${{ env.COMMONLIBF4_REF }}
+          restore-keys: |
+            commonlibf4-${{ runner.os }}-
+
+      - name: Cache vcpkg deps (binary cache)
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/vcpkg_cache
+          # vcpkg.json 含 builtin-baseline + spdlog/minhook/yaml-cpp ⇒ 依赖变更时自动失效
+          key: vcpkg-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
+
+      - name: Locate vcpkg and export VCPKG_ROOT
+        shell: pwsh
+        run: |
+          Write-Host "VCPKG_INSTALLATION_ROOT=$env:VCPKG_INSTALLATION_ROOT"
+          if (-not $env:VCPKG_INSTALLATION_ROOT) {
+            throw "vcpkg not found on runner (VCPKG_INSTALLATION_ROOT is empty)"
+          }
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "VCPKG_ROOT exported -> $env:VCPKG_INSTALLATION_ROOT"
+          # 二进制缓存目录：与上方 actions/cache 的 path 对齐
+          $binCache = "$($env:RUNNER_TEMP -replace '\\','/')/vcpkg_cache"
+          "VCPKG_BINARY_SOURCES=clear;files,$binCache,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "VCPKG_BINARY_SOURCES exported -> $binCache"
+
+      - name: Sync CommonLibF4 (incremental clone/refresh)
+        shell: pwsh
+        run: |
+          $dir = "$env:COMMONLIBF4_DIR"
+          $ref = "$env:COMMONLIBF4_REF"
+          Write-Host "CommonLibF4 ref: $ref"
+          Write-Host "CommonLibF4 dir: $dir"
+
+          function Test-CLReady {
+            (Test-Path "$dir/include/RE/Fallout.h") -and
+            (Test-Path "$dir/lib/commonlib-shared/include/REX/REX.h")
+          }
+
+          if (Test-CLReady) {
+            Write-Host "Cache hit -> refreshing existing checkout at $ref"
+            git -C $dir fetch --depth 1 origin $ref --tags --force 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -eq 0) {
+              git -C $dir checkout --detach --force FETCH_HEAD 2>&1 | ForEach-Object { Write-Host $_ }
+              git -C $dir submodule update --init --recursive --depth 1 2>&1 | ForEach-Object { Write-Host $_ }
+            }
+            if ($LASTEXITCODE -ne 0 -or -not (Test-CLReady)) {
+              Write-Host "Refresh failed or incomplete -> full reclone"
+              Remove-Item -Recurse -Force $dir
+              git clone --depth 1 --recursive --branch $ref https://github.com/libxse/commonlibf4.git $dir
+            }
+          } else {
+            Write-Host "No cache -> full clone"
+            git clone --depth 1 --recursive --branch $ref https://github.com/libxse/commonlibf4.git $dir
+          }
+
+          Write-Host "Verifying CommonLibF4 layout:"
+          Write-Host "  Fallout.h = $(Test-Path "$dir/include/RE/Fallout.h")"
+          Write-Host "  REX.h     = $(Test-Path "$dir/lib/commonlib-shared/include/REX/REX.h")"
+          if (-not (Test-CLReady)) { throw "CommonLibF4 layout incomplete after sync" }
+
+      - name: Configure (cmake --preset default)
+        shell: pwsh
+        run: |
+          # 仓内 CMakeLists 默认走 build/vcpkg_installed（本机已解包的那棵树）。
+          # CI 上它不存在 ⇒ 显式指向 vcpkg 的 manifest 安装目录，并关掉那个缓存变量。
+          # VCPKG_TARGET_TRIPLET 必须显式给：CI 的 vcpkg manifest 模式默认 x64-windows。
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+          Write-Host "VCPKG_TRIPLET=$env:VCPKG_TRIPLET"
+          cmake --preset default `
+            -DCOMMONLIBF4_DIR="$env:COMMONLIBF4_DIR" `
+            -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TRIPLET" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DF4LT_DEP_ROOT=""
+
+      - name: Build F4LoadText.dll (Release)
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target F4LoadText
+
+      - name: Assemble deploy package
+        shell: pwsh
+        run: |
+          # 复刻 tools/deploy.py 的部署结构：
+          #   F4SE/Plugins/F4LoadText.dll
+          #   F4SE/Plugins/F4LoadText.ini
+          #   F4SE/Plugins/F4LoadText/translations/   <- 只建目录（译文不入包）
+          $ws = $env:GITHUB_WORKSPACE
+          $plugins = Join-Path $ws 'build\deploy\F4SE\Plugins'
+          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+          Copy-Item (Join-Path $ws 'build\Release\F4LoadText.dll') $plugins -Force
+          Copy-Item (Join-Path $ws 'config\F4LoadText.ini')    $plugins -Force
+
+          # 译文目录：只放一份说明，让用户知道 yaml 该放哪。
+          # ⚠️ 译文**不入包**（本仓不再公开 translations\）。
+          $translations = Join-Path $plugins 'F4LoadText\translations'
+          New-Item -ItemType Directory -Force -Path $translations | Out-Null
+          $readme = @(
+            '译文字典目录（F4LoadText.ini 的 [Translation] TranslationDir = F4LoadText\translations）',
+            '',
+            '把 translations\*.yaml 放进本目录即可生效（改完重开游戏）。',
+            'yaml 模板可用本仓的 tools\export_esp_yaml.py 从 esp 导出。',
+            'yaml 里的 `path` 写**插件文件名**即可（如 path: "unofficial fallout 4 patch.esp"）；',
+            '插件会自动到 <Data> 下找（MO2 的 mod 目录也认），不需要写完整路径。',
+            '',
+            '首次启动会解析 yaml 并写 dictionary.cache（约 1 秒）；',
+            '之后启动走缓存（约 4 ms）。MO2 下缓存写在 overwrite\ 里，属正常现象。'
+          )
+          # UTF-8 无 BOM，行尾用 CRLF（Windows 记事本友好）
+          $body = ($readme -join "`r`n") + "`r`n"
+          [IO.File]::WriteAllText((Join-Path $translations 'README.txt'), $body, (New-Object Text.UTF8Encoding($false)))
+
+          Write-Host "Deploy contents:"
+          Get-ChildItem $plugins -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      # ── 打包产物（**只产一个 zip**）──────────────────────────────────────
+      #
+      # 为什么不另外传一份「目录树」artifact：两者内容完全一样（同 372 KB），
+      # 而 zip 严格更有用 —— 下载后直接解压到 MO2 mod 目录就能用，
+      # 目录树 artifact 还得先下载再自己套目录。
+      #
+      # 为什么 push/PR 不跑：打包和发布只是「把已有产物换个形式」——
+      # 每次提交都发 Release 会把 Releases 页涞没，zip 也没人每次去下。
+      # 但 **zip artifact 每次都产**（CI 的主要交付物，push 后也能直接取）。
+
+      - name: Resolve package name
+        shell: pwsh
+        run: |
+          # zip 名：手动触发且填了 version 就用它，否则用短 sha。
+          # 用专门的步骤写 $GITHUB_ENV：step 内联赋值无法跨步骤传。
+          $ver = $env:RELEASE_VERSION
+          $name = if ($ver) { $ver } else { $env:GITHUB_SHA.Substring(0, 7) }
+          "ZIP_NAME=F4LoadText-$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "ZIP_NAME=F4LoadText-$name.zip"
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          # 压缩 deploy\F4SE 目录（而不是它的内容），使 zip 里是 F4SE\Plugins\...；
+          # 用户解压到 MO2 的 mod 目录即可（mod 目录下就是 F4SE\）。
+          $ws = $env:GITHUB_WORKSPACE
+          $staging = Join-Path $ws 'build\deploy'
+          $zip = Join-Path $ws $env:ZIP_NAME
+          Compress-Archive -Path (Join-Path $staging 'F4SE') -DestinationPath $zip -Force
+          Write-Host "Created: $zip"
+          Get-Item $zip | Select-Object Name, Length | Format-Table -AutoSize
+          Write-Host "解压后结构："
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::OpenRead($zip).Entries |
+            ForEach-Object { "  " + $_.FullName + "  (" + $_.Length + ")" }
+
+      - name: Upload F4LoadText artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: F4LoadText
+          path: F4LoadText-*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'workflow_dispatch' && env.DO_RELEASE == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: ${{ env.RELEASE_VERSION }}
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

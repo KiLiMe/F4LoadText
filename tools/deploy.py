@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""F4LoadText 一键部署 —— 编译 + 部署到 MO2 mod 目录。
+
+自包含：只用标准库，不依赖仓内其它脚本。
+
+    uv run python tools/deploy.py              # 编译 + 部署
+    uv run python tools/deploy.py --no-build   # 只部署
+    uv run python tools/deploy.py --fresh      # 先清空 mod 目录再部署
+    uv run python tools/deploy.py --check      # 只看状态，不动任何文件
+
+⚠️ 本机四个真实踩过的坑，脚本已经处理：
+  1. 代理变量大小写混用会让 MSBuild 子进程环境字典抛 ArgumentException，
+     **任何** MSVC 构建都失败 —— 构建前必须清掉。
+  2. 游戏运行时 DLL 被锁，复制会失败 —— 脚本先检测进程。
+  3. 版本迭代里删过的文件会留在部署目录（如旧版的 .ini）—— 脚本会清掉。
+  4. **本脚本在 tools/ 下**：项目根是 `__file__` 的上一层（parent.parent），
+     不是 parent —— 写错会让 CMakeLists / config/ / build/ 全部找不到。
+
+📌 ini 是**每次部署整份覆盖**（仓内 config/F4LoadText.ini 为唯一权威）：
+   要调开关就改仓内模板再部署，别只改部署位那份。
+"""
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import local_paths  # noqa: E402  （同目录模块，tools/ 下）
+
+# ── 常量 ─────────────────────────────────────────────────────────────
+# ⚠️ 本脚本在 tools/ 下，项目根是它的**上一层** —— 别改成 parent（那会指到 tools/，
+#    CMakeLists / config/ / build/ 全部找不到）。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# MO2 mods 目录：**本机专属路径，不写进源码**（本仓是公开的）。
+# 取值顺序：--mods-dir 参数 > 环境变量 F4LT_MODS_DIR > 仓根 .f4lt_local.json
+# 的 "mods_dir" > 报错并给出设置方法。详见 tools/local_paths.py。
+MOD_NAME = "F4LoadText"
+
+# 延迟解析：命令行参数要等 argparse 跑完才知道，所以这里先占位，
+# 由 main() 里的 refresh_paths() 一次性算好。
+MODS_DIR: Path = Path()
+MOD_DIR: Path = Path()
+PLUGINS_DIR: Path = Path()
+TRANSLATIONS_DEST: Path = Path()
+
+
+def refresh_paths(mods_dir: Path) -> None:
+    """按 mods 目录重算所有派生路径。main() 里解析完参数后调用一次。"""
+    global MODS_DIR, MOD_DIR, PLUGINS_DIR, TRANSLATIONS_DEST
+    MODS_DIR = mods_dir
+    MOD_DIR = MODS_DIR / MOD_NAME
+    PLUGINS_DIR = MOD_DIR / "F4SE" / "Plugins"
+    # 与 ini 里的 TranslationDir 必须一致（相对 PLUGINS_DIR）。
+    TRANSLATIONS_DEST = PLUGINS_DIR / "F4LoadText" / "translations"
+
+# ── 译文字典来源（`[汉化]`）─────────────────────────────────────────
+# 译文字典现在**自包含在本仓内**（`F4LoadText\translations\`）。
+#
+# 历史：这些 yaml 原本来自 F4TCHook 的 `translations\`（本项目从那里拷）。
+# 2026-10-09 改：① F4TCHook 的 translations\ 已整目录脱离 git 跟踪；
+#               ② 为了不再跨仓依赖（删了 F4TCHook 就没了），把 15 个文件
+#                  （14 个 yaml + 1 个 scaleform_literals.tsv）搬进本仓。
+# ⇒ 改 yaml 只需重新部署一次（见 src/Translation.cpp 的缓存机制）。
+TRANSLATIONS_SRC = PROJECT_ROOT / "translations"
+# 脱敏后的译文（`tools\sanitize_translations.py` 的产物）：`path` 只剩文件名、不带本机目录。
+# **发布包必须用这份**（源目录里的 `path` 是导出机绝对路径）。
+TRANSLATIONS_SANITIZED = PROJECT_ROOT / "dist" / "translations"
+# TRANSLATIONS_DEST 在 refresh_paths() 里算（它依赖 MODS_DIR）。
+
+# meta.ini：**可选**。仓内有就用它覆盖部署位；没有就整个跳过（MO2 自己会建一份）。
+#
+# 为什么是可选：meta.ini 是 MO2 亲手写的元数据（modid / lastNexusQuery / tracked /
+# validated / color / [installedFiles] …），里面一半以上是**机器本地状态**，随每次
+# 启动变化 ⇒ 不适合入库，已在 .gitignore 里。
+#
+# ⚠️ 但 version / name / description / notes 这几行是有意义的（改版本号要同步），
+#    所以想让它入库就 `git add -f config/meta.ini` —— 有文件就照旧整份拷贝。
+META_TEMPLATE = PROJECT_ROOT / "config" / "meta.ini"
+
+# 插件 ini 模板：**每次部署都整份覆盖**目标那份（仓内 config/F4LoadText.ini 是唯一权威）。
+#
+# 为什么改成覆盖（原先是「只在不存在时拷」）：
+#   原先的写法保护了手改，但也让**新加的 ini 键永远到不了部署位** —— 代码里新增的旋钮
+#   （审计上限 / 字幕详情 / 审计签名…）在磁盘上根本看不到，只能靠默认值生效，
+#   排查时“以为 ini 里写着”就成了假前提。现在两边永远一致：要调开关就改仓内模板再部署。
+CONFIG_TEMPLATE = PROJECT_ROOT / "config" / "F4LoadText.ini"
+
+# 已经废弃、要在部署目录清理掉的老文件（本版为空）。
+STALE_FILES: list[str] = []
+
+# 编译前必须清掉的代理变量（本机 MSVC 老坑）。
+PROXY_VARS = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy"]
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stamp(path: Path) -> str:
+    """可读的时间戳。用 datetime 而不是 f-string 的格式说明符 ——
+    `st_mtime` 是 float，`{x:%Y-%m-%d}` 会抛 ValueError。"""
+    return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def game_running() -> bool:
+    """游戏在跑就锁着 DLL，复制会失败 —— 先问清楚比事后报错好。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Fallout4.exe", "/NH"],
+            capture_output=True, text=True, timeout=15)
+        return "Fallout4.exe" in out.stdout
+    except Exception:
+        return False  # 查不到就不拦，让复制自己去报错
+
+
+def clean_proxy_env() -> None:
+    for name in PROXY_VARS:
+        if name in os.environ:
+            del os.environ[name]
+
+
+def build(cfg: str) -> bool:
+    print("  🔨 编译中…")
+    clean_proxy_env()
+    r = subprocess.run(
+        ["cmake", "--build", "build", "--config", cfg],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, errors="replace")
+    if r.returncode != 0:
+        print("  ❌ 编译失败：")
+        tail = (r.stdout or "")[-1500:] + (r.stderr or "")[-800:]
+        print(tail)
+        return False
+
+    errors = [l for l in (r.stdout or "").splitlines() if "error C" in l]
+    warns = [l for l in (r.stdout or "").splitlines() if "warning C" in l]
+    print(f"  ✅ 编译成功（error={len(errors)} warning={len(warns)}）")
+    if errors:
+        for l in errors[:5]:
+            print(f"       {l.strip()}")
+    return True
+
+
+def find_dll(cfg: str) -> Path | None:
+    dll = PROJECT_ROOT / "build" / cfg / "F4LoadText.dll"
+    if dll.exists():
+        return dll
+    found = list((PROJECT_ROOT / "build").rglob("F4LoadText.dll"))
+    return found[0] if found else None
+
+
+def write_meta() -> bool:
+    """如果仓内有 `config/meta.ini`，就拷到部署位；没有则跳过（不算失败）。
+
+    meta.ini 主体是 MO2 的机器本地状态，不入库；仓内那份是**可选**的手工副本，
+    用来钉住 version / name / description 这类有意义的字段。
+    """
+    if not META_TEMPLATE.exists():
+        print("  · meta.ini  ：跳过（仓内没有 config/meta.ini，保留 MO2 自己那份）")
+        return True
+    shutil.copy2(META_TEMPLATE, MOD_DIR / "meta.ini")
+    return True
+
+
+def copy_translations(src_dir=None):
+    r"""把 `translations\*.yaml` 拷进 mod（`[汉化]` 用）。
+
+    返回 (文件数, 字节数)；源目录缺失时返回 None（**只告警不失败** ——
+    汉化功能可以关着用）。
+
+    `src_dir` 默认为仓内 `translations\`；传 `--translations dist` 时用脱敏副本。
+
+    ⚠️ 必须拷到 mod 目录：游戏进程只能看到 MO2 虚拟目录，仓内路径它根本看不到。
+    ⚠️ 只拷 `*.yaml`/`*.yml` —— `Translation.cpp` 也只认这两种扩展名；
+       `translations` 目录里别的文件（如 `scaleform_literals.tsv`）**故意不拷**，
+       它们是同源历史工具的输入，不属于本插件的运行数据。
+    """
+    src_dir = src_dir or TRANSLATIONS_SRC
+    if not src_dir.is_dir():
+        print(f"  ⚠️  译文源目录不存在，跳过（{src_dir}）")
+        return None
+
+    TRANSLATIONS_DEST.mkdir(parents=True, exist_ok=True)
+    # 先清掉上一次的（yaml 可能被重命名/删除 —— 留着旧文件会写成一份不存在的译文）
+    for old in TRANSLATIONS_DEST.glob("*.y*ml"):
+        old.unlink()
+
+    n_files = n_bytes = 0
+    for src in sorted(src_dir.glob("*.y*ml")):
+        shutil.copy2(src, TRANSLATIONS_DEST / src.name)
+        n_files += 1
+        n_bytes += src.stat().st_size
+    return (n_files, n_bytes) if n_files else None
+
+
+def deploy(cfg: str, fresh: bool, sanitized: bool = False) -> int:
+    print(f"═══ {MOD_NAME} 部署 ═══")
+    print(f"  配置 : {cfg}")
+    print(f"  目标 : {MOD_DIR}")
+    print()
+
+    dll = find_dll(cfg)
+    if not dll:
+        print("  ❌ 未找到 F4LoadText.dll，请先编译：")
+        print(f"     cd {PROJECT_ROOT}")
+        print("     cmake --preset default")
+        print("     cmake --build build --config Release")
+        return 1
+    print(f"  ✅ DLL  : {dll}  ({dll.stat().st_size:,} B)")
+
+    if fresh and MOD_DIR.exists():
+        print("  🗑️  清空 mod 目录 (--fresh)…")
+        shutil.rmtree(MOD_DIR)
+
+    PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 清掉本版不再产出的文件（旧版 .ini 等）—— 留着会让人以为开关还在那儿。
+    for name in STALE_FILES:
+        stale = PLUGINS_DIR / name
+        if stale.exists():
+            stale.unlink()
+            print(f"  🧹 删除过时文件: {stale.name}")
+
+    target = PLUGINS_DIR / "F4LoadText.dll"
+    try:
+        shutil.copy2(dll, target)
+    except PermissionError:
+        print(f"  ❌ 无法写入 {target} —— DLL 被占用（游戏还在运行？）")
+        return 1
+    print(f"  📦 DLL  → {target}")
+
+    # 复制后校验：别让「以为部署好了」变成排查时的假前提。
+    src_hash, dst_hash = sha256(dll), sha256(target)
+    if src_hash != dst_hash:
+        print("  ❌ 复制后哈希不一致（磁盘问题？）")
+        return 1
+    print(f"  🔒 SHA256 {src_hash[:16]}… ✓")
+
+    # 配置：<游戏>\\Data\\F4SE\\Plugins\\F4LoadText.ini（与 ImeControl 同一约定）= 也就是 mod 目录里这份。
+    # **每次整份覆盖**：仓内的 config/F4LoadText.ini 是唯一权威，避免“磁盘上有新键吗”这类假前提。
+    ini_dest = PLUGINS_DIR / "F4LoadText.ini"
+    if not CONFIG_TEMPLATE.exists():
+        print(f"  ⚠️  ini 模板缺失，跳过（{CONFIG_TEMPLATE}）")
+    else:
+        shutil.copy2(CONFIG_TEMPLATE, ini_dest)
+        same = ini_dest.exists() and CONFIG_TEMPLATE.read_bytes() == ini_dest.read_bytes()
+        print(f"  📋 ini   → {ini_dest}  ({ini_dest.stat().st_size:,} B，{'与模板一致' if same else '已覆盖'})")
+
+    if not write_meta():
+        return 1
+    if META_TEMPLATE.exists():
+        print(f"  📋 meta.ini → {MOD_DIR / 'meta.ini'}")
+
+    # 译文字典：把本仓 translations\*.yaml 拷进本 mod。
+    #
+    # 为什么拷而不“直接读仓内”：游戏进程只能看到 MO2 虚拟目录下的东西，
+    # 本仓路径（源码目录）在游戏里根本不存在。拷到 mod 目录 → 改完 yaml
+    # **重新部署一次**就生效（不用再跑 build_flatbuffer_dict.py）。
+    #
+    # ⚠️ 源目录缺失（没 clone F4TCHook）时**只告警不失败** —— 汉化功能可以关着用。
+    counts = copy_translations(TRANSLATIONS_SANITIZED if sanitized else None)
+    if counts is not None:
+        n_files, n_bytes = counts
+        tag = "（脱敏副本）" if sanitized else ""
+        print(f"  📖 译文 → {TRANSLATIONS_DEST}  ({n_files} 个 yaml，{n_bytes:,} B){tag}")
+
+    print()
+    print("═══ 部署完成 ═══")
+    print(f"  {MOD_DIR}")
+    print()
+    print("  下一步：")
+    print("    1. MO2 里启用「F4LoadText」mod（已启用则跳过）")
+    print("    2. 进游戏 → 读一个存档 → 进到世界 → 退出")
+    print("    3. 看日志（F4SE 日志目录）：")
+    print(f"       Get-Content \"$([Environment]::GetFolderPath('MyDocuments'))\\My Games\\Fallout4\\F4SE\\F4LoadText.log\"")
+    print("         应有 3 行 `hook ok`（LoadFullNameChunk / Load(2194235) / Load2(2194240)）")
+    print("         + 1 行 `hook 延后`（GetDescription(2193019)，由 kGameDataReady 装）")
+    print("         读档完成时：`DESC 映射: 全表单扫描=… 带 TESDescription 组件=…`")
+    print("         以及一行汇总：`replace: 读盘期字段 忽略传入=… （其中自取基表=…）`")
+    print("       日志开关都在 ini（信息 / 审计上限 / 审计签名 / 高级）—— 改**仓内模板**再部署。")
+    return 0
+
+
+def check(cfg: str) -> int:
+    print(f"═══ {MOD_NAME} 状态检查 ═══")
+    print(f"  项目 : {PROJECT_ROOT}")
+    print(f"  mod  : {MOD_DIR}  {'存在' if MOD_DIR.exists() else '不存在'}")
+    print()
+
+    dll = find_dll(cfg)
+    if dll:
+        print(f"  构建产物 : {dll}")
+        print(f"             {dll.stat().st_size:,} B   {stamp(dll)}")
+    else:
+        print("  构建产物 : ❌ 未编译")
+        return 1
+
+    target = PLUGINS_DIR / "F4LoadText.dll"
+    if target.exists():
+        print(f"  部署位   : {target}")
+        print(f"             {target.stat().st_size:,} B   {stamp(target)}")
+        same = sha256(dll) == sha256(target)
+        print(f"  是否同步 : {'✅ 一致' if same else '⚠️  不一致（部署位是旧的，需重新部署）'}")
+    else:
+        print(f"  部署位   : ❌ 未部署（{target}）")
+
+    print()
+    print(f"  游戏进程 : {'⚠️  正在运行（DLL 被锁，无法部署）' if game_running() else '未运行 ✓'}")
+    print(f"  MO2 mods : {'存在' if MODS_DIR.exists() else '❌ 不存在（查 --mods-dir / F4LT_MODS_DIR / .f4lt_local.json）'}")
+
+    d = MOD_DIR / "F4SE" / "Plugins" / "F4LoadText.ini"
+    if CONFIG_TEMPLATE.exists() and d.exists():
+        same = CONFIG_TEMPLATE.read_bytes() == d.read_bytes()
+        print(f"  ini 模板 : {CONFIG_TEMPLATE}  ({CONFIG_TEMPLATE.stat().st_size:,} B)")
+        print(f"  ini 部署 : {d}  ({d.stat().st_size:,} B)")
+        print(f"             {'✅ 与模板一致' if same else '⚠️  与模板不同（部署会以模板覆盖）'}")
+    else:
+        print("  ini 模板/部署 : ❌ 缺一个（模板或部署位不存在）")
+
+    # meta.ini：模板 vs 部署位。MO2 会自己重写这份文件，所以两边「不同」是常态 ——
+    # 分别报出来，让人自己判断该不该拿磁盘上的那份去更新模板。
+    dest_meta = MOD_DIR / "meta.ini"
+    if META_TEMPLATE.exists():
+        print(f"  meta 模板 : {META_TEMPLATE}  ({META_TEMPLATE.stat().st_size:,} B)")
+        if dest_meta.exists():
+            same = META_TEMPLATE.read_bytes() == dest_meta.read_bytes()
+            print(f"  meta 部署 : {dest_meta}")
+            print(f"              {'✅ 与模板一致' if same else '⚠️  与模板不同（MO2 可能重写过；部署会以模板覆盖）'}")
+        else:
+            print(f"  meta 部署 : ❌ 不存在")
+    else:
+        print(f"  meta 模板 : ❌ 缺失（{META_TEMPLATE}）—— 部署时会报错")
+
+    print()
+    print(f"  过时文件 : {', '.join(STALE_FILES)}（本版不再产出，部署时会自动清理）")
+
+    # 译文（`[汉化]`）：源目录 vs 部署位。
+    # 这里是排查“改了 yaml 没生效”的第一站（最常见原因就是忘了重新部署）。
+    print()
+    if not TRANSLATIONS_SRC.is_dir():
+        print(f"  译文源   : ❌ 不存在（{TRANSLATIONS_SRC}）")
+    else:
+        src_files = sorted(TRANSLATIONS_SRC.glob("*.y*ml"))
+        dst_files = sorted(TRANSLATIONS_DEST.glob("*.y*ml")) if TRANSLATIONS_DEST.is_dir() else []
+        src_names = {f.name for f in src_files}
+        dst_names = {f.name for f in dst_files}
+        print(f"  译文源   : {TRANSLATIONS_SRC}")
+        print(f"             {len(src_files)} 个 yaml")
+        print(f"  译文部署 : {TRANSLATIONS_DEST}")
+        if not dst_files:
+            print("             ❌ 未部署（部署时会拷过去）")
+        elif src_names != dst_names:
+            only_src = sorted(src_names - dst_names)
+            only_dst = sorted(dst_names - src_names)
+            extra = (f"; 只在源: {', '.join(only_src)}" if only_src else "") \
+                  + (f"; 只在部署位: {', '.join(only_dst)}" if only_dst else "")
+            print(f"             {len(dst_files)} 个 yaml，⚠️  与源不同名{extra}（重新部署即可对齐）")
+        else:
+            # 同名时再比内容：源是人手改的、部署位是拷的 ⇒ “改了 yaml 没部署”很常见。
+            diff = [f.name for f in src_files
+                    if not (TRANSLATIONS_DEST / f.name).exists()
+                    or f.read_bytes() != (TRANSLATIONS_DEST / f.name).read_bytes()]
+            if diff:
+                more = " …" if len(diff) > 4 else ""
+                print(f"             {len(dst_files)} 个 yaml，⚠️  {len(diff)} 个内容不同（改了 yaml 没部署？）: "
+                      f"{', '.join(diff[:4])}{more}")
+            else:
+                print(f"             {len(dst_files)} 个 yaml，✅ 与源一致")
+
+        # 二进制缓存（译文字典快路径）。
+        # ⚠️ MO2（USVFS）下 DLL 的写入会被重定向到 `MO2\overwrite\f4se\plugins\F4LoadText\translations\`，
+        #    所以**不在 mod 目录里找**，而是看 overwrite（mod 目录那份是直部署旧版才可能有的）。
+        cache_in_mod = TRANSLATIONS_DEST / "dictionary.cache"
+        cache_in_ow = MODS_DIR.parent / "overwrite" / "f4se" / "plugins" / "F4LoadText" / "translations" / "dictionary.cache"
+        where, cache = ("overwrite", cache_in_ow) if cache_in_ow.is_file() else \
+                       ("mod 目录", cache_in_mod) if cache_in_mod.is_file() else (None, None)
+        if cache is not None:
+            print(f"  字典缓存 : {cache.stat().st_size / 1024:,.0f} KB（在 {where}）—— 仅加速用；yaml 变了会自动重建")
+            print(f"             {cache}")
+        else:
+            print("  字典缓存 : （无）—— 首次启动会解析 yaml 并生成（MO2 下落盘在 overwrite）")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=f"{MOD_NAME} 一键部署（编译 + 复制到 MO2 mod 目录）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    p.add_argument("--debug", action="store_true", help="用 Debug 配置（默认 Release）")
+    p.add_argument("--no-build", action="store_true", help="跳过编译，只部署现有产物")
+    p.add_argument("--fresh", action="store_true", help="部署前清空 mod 目录")
+    p.add_argument("--check", action="store_true", help="只看状态，不改任何文件")
+    p.add_argument("--force", action="store_true", help="游戏运行时也强行部署（通常没用）")
+    p.add_argument("--sanitize-translations", dest="sanitized", action="store_true",
+                   help="用 dist\\translations（脱敏副本，path 只剩文件名）—— 发布包用这个")
+    p.add_argument("--mods-dir", default=None,
+                   help="MO2 mods 目录。默认取环境变量 F4LT_MODS_DIR，或仓根 .f4lt_local.json 的 mods_dir")
+    args = p.parse_args()
+
+    # 解析 MO2 mods 目录：参数 > 环境变量 > 本地配置 > 报错。
+    # 必须在任何 MOD_DIR / PLUGINS_DIR 使用之前完成。
+    if args.mods_dir:
+        refresh_paths(Path(args.mods_dir))
+    else:
+        refresh_paths(Path(local_paths.require_path("mods_dir", "--mods-dir <MO2 mods 目录>")))
+
+    if not MODS_DIR.is_dir():
+        print(f"  ❌ MO2 mods 目录不存在：{MODS_DIR}")
+        print("     请检查 --mods-dir / F4LT_MODS_DIR / .f4lt_local.json 里的 mods_dir。")
+        return 1
+
+    cfg = "Debug" if args.debug else "Release"
+
+    if args.check:
+        return check(cfg)
+
+    if game_running() and not args.force:
+        print("  ⚠️  检测到 Fallout4.exe 正在运行 —— DLL 被锁，复制会失败。")
+        print("      请先完全退出游戏再部署（--force 可强行尝试）。")
+        return 1
+
+    if not args.no_build:
+        if not build(cfg):
+            return 1
+    else:
+        print("  ⏭️  跳过编译 (--no-build)")
+
+    return deploy(cfg, args.fresh, args.sanitized)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
