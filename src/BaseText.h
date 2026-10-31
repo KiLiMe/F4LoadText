@@ -25,8 +25,12 @@ namespace BaseText
 	//   ⚠️ **读盘期绝不能这么干**：实测拿回来是引擎的 `LOOKUP FAILED!` 占位
 	//   （这个解析依赖“正在读那个文件”的上下文，见 Replace.cpp 的实测注释）
 	//   ⇒ 读盘期保持自解字符串表。
+	//
+	// `a_occurrence`：同一记录里**第几个**同名 chunk（0 = 第一个）。
+	//   INFO 的**多句台词** = 多个 `NAM1`；只取第一个 ⇒ 后面几句全被写成第一句（2026-10-31 实测）。
+	//   口径与 `Replace` 记忆表的 `seq` 同源（同一引擎、同一读取顺序）。
 	[[nodiscard]] std::string_view Get(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
-		std::string_view a_leg = {}, bool a_displayLayer = false);
+		std::string_view a_leg = {}, bool a_displayLayer = false, std::size_t a_occurrence = 0);
 
 	// 取chunk 的**原始 4 字节**（本地化字符串表 id），**不查表**。
 	// 显示层用：拿到 id 后交给引擎自己的 `BGSLocalizedStringDL::GetText(TESFile&)` 解析 ——

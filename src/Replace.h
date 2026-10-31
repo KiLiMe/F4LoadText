@@ -59,15 +59,20 @@ namespace Replace
 	//   为什么不用字段地址 ✗：引擎解析子记录用的是**会复用的临时对象**，
 	//   同一记录里不同字段的地址会撞车（实测：ARMO 的 "Default"/"Light" 被塞进了 FULL 的中文名 ✗）。
 	//   序号必须**按读取文件分开计**（否则基表与覆盖两次读取会串号）✓
+	//
+	// a_seq = 调用方**已经占好的号**（-1 = 本函数自己取）。
+	//   ⚠️ 为什么需要它：一次钩子调用里可能有“命中译文就提前返回”的分支，
+	//   如果那个分支不占号，后面几句的 seq 就整体**左移一位** ⇒ 第 2 句拿到第 1 句的基表文本
+	//   （= 2026-10-31 “字幕总是同一句”的第二条成因）。⇒ 序号必须在**函数入口**取一次。
 	void RememberOwnText(std::uint32_t a_chunkID, std::string_view a_text, std::string_view a_plugin,
-		std::uint32_t a_rawID, const RE::TESFile* a_file);
+		std::uint32_t a_rawID, const RE::TESFile* a_file, int a_seq = -1);
 	// 取回“基表那份”。
 	//   a_file   = **正在读的那个文件**（序号按它分开计，必传）
 	//   a_seqOut = 出参：本次读取的序号（-1 = 超限）。
 	//      ⚠️ seq **不是“数组下标”**：它是“这个 chunk 在本次读取里第几次出现”，
 	//      而引擎会把同一个单值字段（实测 `FULL`）重复读很多次。别拿它做数组长度校验。
 	[[nodiscard]] std::string_view RememberedOwnText(std::uint32_t a_chunkID, std::string_view a_plugin,
-		std::uint32_t a_rawID, const RE::TESFile* a_file, int* a_seqOut = nullptr);
+		std::uint32_t a_rawID, const RE::TESFile* a_file, int* a_seqOut = nullptr, int a_seq = -1);
 
 	// 这条记录是否在名单里（不看类别值，只看 [名单]）
 	[[nodiscard]] bool IsListed(std::string_view a_plugin, std::uint32_t a_rawID);

@@ -8,6 +8,7 @@
 #include <fstream>
 
 #include "StrUtil.h"
+#include "Paths.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 译文字典的**二进制缓存**（`dictionary.cache`）。
@@ -189,7 +190,7 @@ namespace DictionaryCache
 		{
 			std::ofstream f{ tmp, std::ios::binary | std::ios::trunc };
 			if (!f || !f.write(out.data(), static_cast<std::streamsize>(out.size()))) {
-				REX::WARN("translation: cache write failed ({}) -- will be rebuilt next time", tmp.string());
+				REX::WARN("translation: cache write failed ({}) -- will be rebuilt next time", Paths::ForLog(tmp));
 				return;
 			}
 		}
@@ -200,7 +201,7 @@ namespace DictionaryCache
 			std::filesystem::rename(tmp, dst, ec);
 		}
 		if (ec) {
-			REX::WARN("translation: cache rename failed ({}) -- will be rebuilt next time: {}", dst.string(), ec.message());
+			REX::WARN("translation: cache rename failed ({}) -- will be rebuilt next time: {}", Paths::ForLog(dst), ec.message());
 			std::filesystem::remove(tmp, ec);
 			return;
 		}

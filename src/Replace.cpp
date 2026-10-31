@@ -316,7 +316,7 @@ namespace
 }
 
 void Replace::RememberOwnText(std::uint32_t a_chunkID, std::string_view a_text, std::string_view a_plugin,
-	std::uint32_t a_rawID, const RE::TESFile* a_file)
+	std::uint32_t a_rawID, const RE::TESFile* a_file, int a_seq)
 {
 	// ⚠️ **序号必须先取、无条件取** —— 即使文本为空。
 	//
@@ -326,7 +326,7 @@ void Replace::RememberOwnText(std::uint32_t a_chunkID, std::string_view a_text, 
 	//   只要基表某个 WNAM 是空的（实测存在：`dn_CommonGun` 的 ruleset[2] 有 2 个、[4] 有 1 个），
 	//   从那个位置起整列**左移一位** ⇒ `Scoped` 拿到「长枪管」、`Short` 拿到「冰晶」。
 	//   ⇒ 两边必须“看得到同一条就占同一个号”，哪怕它没内容。
-	const auto seq = NextSeq(a_file, a_chunkID, a_plugin, a_rawID);
+	const auto seq = a_seq >= 0 ? a_seq : NextSeq(a_file, a_chunkID, a_plugin, a_rawID);
 	if (seq < 0 || a_text.empty()) {
 		return;   // 号已经占了；空文本不存储（但序号要保留）
 	}
@@ -337,9 +337,9 @@ void Replace::RememberOwnText(std::uint32_t a_chunkID, std::string_view a_text, 
 }
 
 std::string_view Replace::RememberedOwnText(std::uint32_t a_chunkID, std::string_view a_plugin,
-	std::uint32_t a_rawID, const RE::TESFile* a_file, int* a_seqOut)
+	std::uint32_t a_rawID, const RE::TESFile* a_file, int* a_seqOut, int a_seq)
 {
-	const auto seq = NextSeq(a_file, a_chunkID, a_plugin, a_rawID);
+	const auto seq = a_seq >= 0 ? a_seq : NextSeq(a_file, a_chunkID, a_plugin, a_rawID);
 	if (a_seqOut) {
 		*a_seqOut = seq;
 	}
@@ -396,6 +396,17 @@ void Replace::LogAudit(const char* a_leg, const RE::TESFile* a_file, std::string
 {
 	const auto& cfg = Config::Get();
 
+	// 「信息」是**总闸**（2026-11-01）：关掉它 = 一条 INFO 都不写，审计也在里面。
+	//
+	// 为什么把它放第一句：审计行是 `REX::INFO` 直通（不走 `LOG_INFO` 宏，见 Config.h:89），
+	// 所以以前「信息=false + 审计上限=200」照样会把每一处改动格式化 + 写盘 ——
+	// 关日志的人本来就是为了省这点开销，结果一点没省。现在关了就真的什么都不做：
+	// 连 formID/sig 都不用取，更不用跑审计文本的子串过滤。
+	// ⚠️ 代价是「关了信息却留着审计上限」会静默失效 ⇒ Config::Load 末尾有一条 WARN 点出来。
+	if (!cfg.info) {
+		return;
+	}
+
 	// 签名与 formID 的**唯一来源** = 正在读的那条记录（见 Replace.h 的同名注释）。
 	// 拿不到文件就没什么可报的（调用点都在已确认 a_file 非空的路径上）。
 	if (!a_file) {
@@ -408,16 +419,19 @@ void Replace::LogAudit(const char* a_leg, const RE::TESFile* a_file, std::string
 	// 它的用途就是“不管发生了什么，先把这条记录的每一步打出来”。
 	const bool focused = Config::IsFocus(a_owner, a_rawID) || Config::IsFocus(a_file->filename, a_rawID);
 
+	const auto limit = cfg.auditLimit;
+	if (limit == 0 && !focused) {
+		return;
+	}
+
 	// 真改动：读入的那份与写回的那份不同。
 	// ⚠️ 门槛**必须带 `!focused`**：否则「关注记录」在“读入 == 写回”（空操作）时也打不出来，
 	//    与 §4.1「有没有改动都打」矛盾。（2026-10 修：原先这行前还有一次无条件的早退，
 	//    把 focused 绕过整个吃掉了。）
+	//
+	// ⚠️ 顺序（2026-11-01）：**上限的早退放在比较之前** —— 审计关着（默认）时，每次回写
+	//    只需两次空检查 + 一个整数比较，连字符串比较都不用做。
 	if (a_read == a_kept && !focused) {
-		return;
-	}
-
-	const auto limit = cfg.auditLimit;
-	if (limit == 0 && !focused) {
 		return;
 	}
 
@@ -438,6 +452,25 @@ void Replace::LogAudit(const char* a_leg, const RE::TESFile* a_file, std::string
 			}
 		}
 		if (!listed) {
+			return;
+		}
+	}
+
+	// 文本子串过滤（[调试] 审计文本）：读入的那份或写回的那份命中任一子串才打。
+	//
+	// 位置有讲究 —— 放在签名过滤**之后**、额度**之前**：不命中的行直接返回，
+	// 一条都不占额度。这正是“上限总在真正想看的行前面用完”的解法
+	// （2026-10-31：188 + 12 = 200 = AuditLimit，日志正好断在帽子上）。
+	// 关注记录（focused）不受此限制，它本来就要一路打全。
+	if (!cfg.auditText.empty() && !focused) {
+		bool hit = false;
+		for (const auto& want : cfg.auditText) {
+			if (a_read.find(want) != std::string_view::npos || a_kept.find(want) != std::string_view::npos) {
+				hit = true;
+				break;
+			}
+		}
+		if (!hit) {
 			return;
 		}
 	}
@@ -473,6 +506,11 @@ bool Replace::HandleFullNameField(RE::TESFullName& a_field, const RE::TESFile* a
 			IsListed(a_plugin, a_rawID), a_readerListed, OneLine(a_loaded));
 	}
 
+	// ⚠️ **每次调用只占一次号，且在函数入口**（2026-10-31）：下面有“命中译文直接 return”的分支，
+	//    那些分支不占号 ⇒ 同一记录里后续字段的 seq 整体**左移一位** ⇒ 第 2 句拿到第 1 句的基表文本
+	//    （“字幕总是同一句”的第二条成因）。序号口径 = 同一记录里第几个同名 chunk。
+	const int seq = NextSeq(a_file, ChunkID(a_file), a_plugin, a_rawID);
+
 	// ── yaml 译文（`[汉化]`）——**优先级高于基底**（用户 2026-10-08 裁定）
 	//
 	// ⚠️ 必须放在名单判断**之前**：名单里是官方 master，而 yaml 管的是 mod 自己的记录
@@ -502,15 +540,14 @@ bool Replace::HandleFullNameField(RE::TESFullName& a_field, const RE::TESFile* a
 	if (a_readerListed) {
 		// 读取者（正在读它的那个插件）自己在名单里 → **采用它读进来的文本**，什么都不写。
 		// 同时记住，供之后被“名单外覆盖”时回落。
-		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file);
+		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file, seq);
 		return true;
 	}
 	if (a_ownerRead) {
-		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file);   // 记住基表那份
+		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file, seq);   // 记住基表那份
 	}
 	if (!a_ownerRead) {
-		int        seq = -1;
-		const auto remembered = RememberedOwnText(ChunkID(a_file), a_plugin, a_rawID, a_file, &seq);
+		const auto remembered = RememberedOwnText(ChunkID(a_file), a_plugin, a_rawID, a_file, nullptr, seq);
 		// 忽略文本传入：写回"基表那份"（读前非空就用读前，否则用记住的 —— 压缩记录读前往往是空的）
 		const auto keep = !a_previous.empty() ? a_previous : remembered;
 		// ⚠️ 这里曾有“数组对齐护栏”（seq ≥ 基表条数就不写）—— 已撤回，因为它误伤大量非数组字段：
@@ -539,6 +576,11 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 			IsListed(a_plugin, a_rawID), a_readerListed, OneLine(a_loaded));
 	}
 
+	// ⚠️ **每次调用只占一次号，且在函数入口**（2026-10-31）：下面有“命中译文直接 return”的分支，
+	//    那些分支不占号 ⇒ 同一记录里后续 `NAM1` 的 seq 整体**左移一位** ⇒ 第 2 句拿到第 1 句的基表文本
+	//    （“字幕总是同一句”的第二条成因）。
+	const int seq = NextSeq(a_file, ChunkID(a_file), a_plugin, a_rawID);
+
 	// ── yaml 译文（`[汉化]`）——优先级高于基底（用户 2026-10-08 裁定）
 	//
 	// ⚠️ 必须放在名单判断**之前**：名单里装的是官方 master，而 yaml 管的是 mod 自己的记录
@@ -563,11 +605,11 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 		return false;
 	}
 	if (a_readerListed) {
-		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file);   // 读取者在名单 → 采用它的文本
+		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file, seq);   // 读取者在名单 → 采用它的文本
 		return true;
 	}
 	if (a_ownerRead) {
-		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file);
+		RememberOwnText(ChunkID(a_file), a_loaded, a_plugin, a_rawID, a_file, seq);
 	}
 	if (!a_ownerRead) {
 		// ⚠️ **`*` 不写**（2026-10-09 修，实测踩过 INNR 拼装名）。
@@ -588,9 +630,21 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 		if (a_formCode == Chunk::kInnr && a_loaded == "*") {
 			return true;
 		}
-		int        seq = -1;
-		const auto remembered = RememberedOwnText(ChunkID(a_file), a_plugin, a_rawID, a_file, &seq);
-		std::string keep{ !a_previous.empty() ? a_previous : remembered };
+		const auto remembered = RememberedOwnText(ChunkID(a_file), a_plugin, a_rawID, a_file, nullptr, seq);
+		// ⚠️ `a_previous` 是**目标对象在读之前的内容**，不是「基表那份文本」。
+		//    引擎解析子记录用的是**会复用的临时对象**（AGENTS.md 第 3 条 / 节点2 §记忆 key），
+		//    所以它只在「基表那条**也**被读过」时才等于本条记录的基表文本；
+		//    而 INFO 恰恰经常**只解析胜出的覆盖**（见下面 BaseText 那段注释）。
+		//    那种情况下 `a_previous` = **上一条记录遗留的文字** ⇒ 写回去 = 把上一句当成这一句；
+		//    更糟的是写进的是同一个临时对象 ⇒ 下一条记录再读到它 ⇒ **之后每一句都变成这一句**。
+		//    实测症状（2026-10-31）：对话里第一句正常，之后字幕**一直显示第一句**，
+		//    但音频/口型是后续台词（原版字幕同样如此 ⇒ 不是显示层的问题）。
+		//    ⇒ INFO 只用「记住的基表文本」或 `BaseText` 自取；两者都没有就**什么都不写**
+		//      （保留引擎自己读进来的那份 —— 至少是这一句的）。
+		std::string keep{ remembered };
+		if (keep.empty() && a_formCode != Chunk::kInfo) {
+			keep = a_previous;   // 非 INFO：沿用原逻辑（压缩记录读前常已带基表文本）
+		}
 		// ⚠️ 这里曾有“数组对齐护栏”—— 已撤回（同 FullName 腿），它误伤非数组字段。
 		// ⚠️ 2026-10-07 实测：这里同步扫插件文件会让**加载界面卡死** ✗（315 MB 的 esm、
 		//    逐表头读取上百万次）→ 暂时关闭，等改成 mmap/分块扫描再开（见 kEnableBaseText）。
@@ -608,7 +662,14 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 			//   我们自己：一次遍历基表插件建索引 → 取这条记录该 chunk 的 4 字节（字符串表 id）
 			//   → 查 <游戏>\Data\Strings\<基名>_<语言>.ILSTRINGS（游戏本来就在用，内容即简体中文 ✓）
 			//   → 内联文本则直接用 ✓
-			keep = std::string{ BaseText::Get(a_plugin, a_rawID, ChunkID(a_file), "INFO") };
+			// ⚠️ **必须带上 `seq`**（= 这条记录里第几个 `NAM1`）：INFO 的**多句台词**是同一记录里的
+			//    多个 `NAM1`，只取第一个 ⇒ 第 2/3 句全部被写成第 1 句。
+			//    实测（2026-10-31，记录 0X0013A412）：
+			//      `text='要解开需要把每一片钥匙…' -> base='圣三角是一组加密系统…'`
+			//      `text='我每次帮助合成人逃脱…'   -> base='圣三角是一组加密系统…'`
+			//    ⇒ 玩家听到新台词，字幕却一直是第一句（原版字幕同样错，因为改的是记录本身）。
+			keep = std::string{ BaseText::Get(a_plugin, a_rawID, ChunkID(a_file), "INFO", false,
+				static_cast<std::size_t>(seq < 0 ? 0 : seq)) };
 			if (!keep.empty()) {
 				++g_stats.fieldFromBase;   // 统计：靠"自取基表文本"救回来的条数
 			}

@@ -67,4 +67,23 @@ namespace Paths
 		}
 		return (dir / std::filesystem::path{ std::string{ a_plugin } }).string();
 	}
+
+	// 日志/报告里**给人看**的路径：尽量脱敏成相对形式。
+	//   <游戏 exe>\Data\F4SE\Plugins\F4LoadText.ini  →  Data\F4SE\Plugins\F4LoadText.ini
+	//   别的盘/别的目录（MO2 的 mod 文件夹、临时目录…）  →  只留文件名
+	//
+	// ⚠️ 为什么：日志会被整段贴进 bug 报告 / issue，绝对路径带**用户名与安装布局**
+	//    （`F:\Games\SteamLibrary\…`、`C:\Users\<名字>\…`），对诊断零价值。
+	//   用 `lexically_relative`（纯字符串，不碰磁盘、不看文件存不存在）。
+	inline std::string ForLog(const std::filesystem::path& a_path)
+	{
+		if (a_path.empty()) {
+			return "?";
+		}
+		const auto rel = a_path.lexically_relative(DataDir());
+		if (!rel.empty() && rel.native().rfind(L"..", 0) != 0) {
+			return (std::filesystem::path{ "Data" } / rel).string();
+		}
+		return a_path.filename().string();
+	}
 }

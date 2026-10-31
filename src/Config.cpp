@@ -21,6 +21,7 @@ namespace
 {
 	Config::ReplaceConfig g_cfg;
 	std::string           g_used;
+	std::string           g_usedForLog;   // 同一份路径的“可贴进 bug 报告”形式（相对 Data / 只剩文件名）
 	std::string           g_report;   // 逐候选路径的读结果，日志里一行行打出来
 
 	// ── 节点 3 名单 ────────────────────────────────────────────────────────
@@ -129,6 +130,14 @@ namespace
 					a_cfg.auditSignatures.push_back(Lower(item));
 				}
 				++keys;
+			} else if (key == "审计文本" || key == "audittext") {
+				// 逗号分隔的子串（CJK 直接按 UTF-8 字节比对，ini 就是 UTF-8）。
+				// 匹配对象是「读进来的那份」和「写回去的那份」两边。
+				a_cfg.auditText.clear();
+				for (auto& item : SplitComma(val)) {
+					a_cfg.auditText.push_back(std::move(item));
+				}
+				++keys;
 			} else if (key == "关注记录" || key == "focusrecords") {
 				// 指名追踪：条目形态与 [名单] 相同（插件名|ID）；键名随意，值逗号分隔。
 				for (auto& item : SplitComma(val)) {
@@ -181,12 +190,13 @@ void Config::Load()
 		const auto              keys = bytes ? Parse(text, candidate) : 0;
 		const bool              take = (keys > 0 && !adopted);
 
-		g_report += std::format("\n    {}  exists={} bytes={} 键数={}{}", path.string(),
+		g_report += std::format("\n    {}  exists={} bytes={} 键数={}{}", Paths::ForLog(path),
 			std::filesystem::exists(path) ? "Y" : "N", bytes, keys, take ? "   ← 采用" : "");
 
 		if (take) {
 			g_cfg = candidate;
 			g_used = path.string();
+			g_usedForLog = Paths::ForLog(path);   // 日志用：脱敏后的相对路径
 			adopted = true;
 		}
 	}
@@ -222,11 +232,25 @@ void Config::Load()
 	LOG_INFO("whitelist: {} entries  blacklist: {} entries{}  focus: {} entries", g_white.size(), g_black.size(),
 		g_white.empty() ? " (whitelist empty -> nothing is replaced; use Entries = * to replace all)" : "", g_focus.size());
 
-	LOG_INFO("config: using {} -> Enable={} Info={} AuditLimit={} AuditSignatures={} Advanced={} FocusRecords={} Translation={} Dir={} Cache={} AsyncLog={}",
-		g_used, g_cfg.enable, g_cfg.info, g_cfg.auditLimit,
+	LOG_INFO("config: using {} -> Enable={} Info={} AuditLimit={} AuditSignatures={} AuditText={} Advanced={} FocusRecords={} Translation={} Dir={} Cache={} AsyncLog={}",
+		g_usedForLog, g_cfg.enable, g_cfg.info, g_cfg.auditLimit,
 		g_cfg.auditSignatures.empty() ? "(all)" : std::format("{} entries", g_cfg.auditSignatures.size()),
+		g_cfg.auditText.empty() ? "(any)" : std::format("{} entries", g_cfg.auditText.size()),
 		g_cfg.advanced, g_focus.size(), g_cfg.translationEnabled, g_cfg.translationDir, g_cfg.translationCache, g_cfg.asyncLog);
 	LOG_INFO("config: tried each candidate: {}", g_report);
+
+	// 「信息」是总闸（见 Config.h 的宏说明与 Replace::LogAudit 的头一条门槛）。
+	// 关掉信息却还留着审计上限 / 关注记录 = 典型的**静默失效**，必须喊一声：
+	// 这里用 REX::WARN，它不受任何开关限制，一定会出现在日志里。
+	if (!g_cfg.info) {
+		if (g_cfg.auditLimit > 0) {
+			REX::WARN("config: AuditLimit={} but Info=false -> audit lines will NOT be written (audit rides on Info)",
+				g_cfg.auditLimit);
+		}
+		if (!g_focus.empty()) {
+			REX::WARN("config: FocusRecords={} entries but Info=false -> those records will NOT be logged", g_focus.size());
+		}
+	}
 }
 
 const Config::ReplaceConfig& Config::Get()

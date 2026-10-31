@@ -148,10 +148,16 @@ namespace
 		return { b, e };
 	}
 
-	// **按需**读一条记录，在记录体里找第一个匹配的 chunk。
+	// **按需**读一条记录，在记录体里找**第 `a_occurrence` 个**匹配的 chunk（0 = 第一个）。
 	// 口径与旧索引完全一致：只认 `csz ≤ 64`（内联文本/4 字节字符串表 id 都在这个量级）。
+	//
+	// ⚠️ **为什么需要序号**（2026-10-31 实测）：一条 INFO 可以带**多句台词**（多个 `NAM1`，
+	//    每句一条字幕）。以前只取第一个 ⇒ 后面几句全部被写成第一句：
+	//    `read=… text='要解开需要把每一片钥匙…' -> base='圣三角是一组加密系统…' -> wrote '圣三角是一组加密系统…'`
+	//    （同一记录 0X0013A412 连续三条，base 完全相同）⇒ 玩家看到「说了新台词，字幕还是上一句」。
+	//    序号口径与 `Replace` 记忆表的 `seq` 同源（同一引擎、同一读取顺序）。
 	bool ReadChunk(std::string_view a_plugin, const RecordEntry& a_record, std::uint32_t a_chunk4CC,
-		std::vector<std::uint8_t>& a_out)
+		std::size_t a_occurrence, std::vector<std::uint8_t>& a_out)
 	{
 		const auto path = Paths::Plugin(a_plugin);
 		if (path.empty()) {
@@ -165,7 +171,8 @@ namespace
 		std::vector<std::uint8_t> data(a_record.size);
 		if (std::fseek(f, static_cast<long>(a_record.offset), SEEK_SET) == 0 &&
 			std::fread(data.data(), 1, data.size(), f) == data.size()) {
-			std::size_t o = 0;
+			std::size_t o      = 0;
+			std::size_t a_seen = 0;
 			while (o + 6 <= data.size()) {
 				const auto csig = U32(data.data() + o);
 				const auto csz  = static_cast<std::uint32_t>(data[o + 4] | (data[o + 5] << 8));
@@ -173,7 +180,7 @@ namespace
 				if (o + csz > data.size()) {
 					break;   // 截断的记录体：当作没有这个 chunk
 				}
-				if (csig == a_chunk4CC && csz <= 64) {
+				if (csig == a_chunk4CC && csz <= 64 && a_seen++ >= a_occurrence) {
 					a_out.assign(data.begin() + static_cast<std::ptrdiff_t>(o),
 						data.begin() + static_cast<std::ptrdiff_t>(o + csz));
 					ok = true;
@@ -187,8 +194,9 @@ namespace
 	}
 
 	// 读盘取 chunk 原始字节（公共路径，`Get` / `GetLocalizedID` / `GetRawChunk` 都走它）。
+	// `a_occurrence`：同一记录里第几个同名 chunk（INFO 的多句台词 = 多个 `NAM1`）。
 	bool GetRawChunkImpl(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
-		std::vector<std::uint8_t>& a_out)
+		std::vector<std::uint8_t>& a_out, std::size_t a_occurrence = 0)
 	{
 		const auto* idx = EnsureIndex(std::string{ a_plugin });
 		if (!idx) {
@@ -196,7 +204,7 @@ namespace
 		}
 		const auto [b, e] = FindCandidates(*idx, a_formID);
 		for (const auto* it = b; it != e; ++it) {
-			if (ReadChunk(a_plugin, *it, a_chunk4CC, a_out)) {
+			if (ReadChunk(a_plugin, *it, a_chunk4CC, a_occurrence, a_out)) {
 				return true;
 			}
 		}
@@ -470,11 +478,13 @@ namespace
 }
 
 std::string_view BaseText::Get(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
-	std::string_view a_leg, bool a_displayLayer)
+	std::string_view a_leg, bool a_displayLayer, std::size_t a_occurrence)
 {
 	static std::unordered_map<std::string, std::string> cache;   // 缓存在锁内访问 ✓
-	const auto key = std::format("{:.{}}|{:08X}|{:08X}", a_plugin.data(), static_cast<int>(a_plugin.size()),
-		a_formID, a_chunk4CC);
+	// ⚠️ 缓存键必须带 `a_occurrence` —— 否则同一条 INFO 的第 2/3 句台词会拿到第 1 句的结果
+	//    （这正是 2026-10-31 “字幕总是同一句”的根因之一）。
+	const auto key = std::format("{:.{}}|{:08X}|{:08X}|{}", a_plugin.data(), static_cast<int>(a_plugin.size()),
+		a_formID, a_chunk4CC, a_occurrence);
 
 	std::scoped_lock l{ g_lock };
 	if (const auto it = cache.find(key); it != cache.end()) {
@@ -486,7 +496,7 @@ std::string_view BaseText::Get(std::string_view a_plugin, std::uint32_t a_formID
 		// 按需读：二分找记录 → 读那一条记录 → 在记录体里找这个 chunk
 		// （以前是预先建好的“记录 → 全部 chunk”索引，622 MB / 1.2 秒，见 RecordEntry 注释）
 		std::vector<std::uint8_t> bytes;
-		if (GetRawChunkImpl(a_plugin, a_formID, a_chunk4CC, bytes)) {
+		if (GetRawChunkImpl(a_plugin, a_formID, a_chunk4CC, bytes, a_occurrence)) {
 			if (bytes.size() == 4) {
 				const auto id = U32(bytes.data());
 				// ① 显示层：**优先让引擎解**（语言/MO2 覆盖/BA2/表格式都是它的事）。

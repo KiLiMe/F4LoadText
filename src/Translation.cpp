@@ -284,7 +284,7 @@ std::uint32_t Translation::Load()
 	}
 	std::error_code ec;
 	if (!std::filesystem::is_directory(dir, ec)) {
-		REX::WARN("translation: directory not found: {} (translation feature skipped)", dir.string());
+		REX::WARN("translation: directory not found: {} (translation feature skipped)", Paths::ForLog(dir));
 		return 0;
 	}
 

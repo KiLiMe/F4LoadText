@@ -23,6 +23,15 @@ namespace Config
 		// 审计行只对哪些**记录签名**打。逗号分隔，不分大小写；**空 = 全部**，`*` = 同上。
 		//   例：审计签名 = TERM, ARMO, MGEF
 		std::vector<std::string> auditSignatures;
+
+		// ③ 审计：**文本子串**过滤（逗号分隔，任一命中即打）。空 = 不过滤。
+		//
+		// 为什么需要它：签名过滤（`INFO`）只能把范围收到「对话记录」，但 UFO4P 这类补丁
+		// 一次性覆盖上万条 INFO，200 条上限几秒就打满，想找的那一句永远在墙后面
+		// （2026-10-31 实测：`write[String] 188 + write[Translation] 12 = 200 = AuditLimit`，
+		// 日志正好被截断，差点据此得出“没写过”的错误结论）。按文本过滤后，没命中的
+		// 一条都不占额度，上限就不再是问题。
+		std::vector<std::string> auditText;
 		// ③ 高级：诊断总闸（默认 false，与其它键一样显式写在 ini 里）。关着时“关注(…)”与
 		//    “身份判定失败”**都不打**。
 		bool advanced{ false };
@@ -77,7 +86,8 @@ namespace Config
 //   LOG_ADV    高级：诊断信息（默认关）
 //   LOG_ADV_W  高级：诊断告警（默认关；把“我们查不到”这类异常降到这里）
 //
-// ⚠️ 审计（逐条回写）**不走这三个宏**：它由“审计上限 / 审计签名”单独控制。
+// ⚠️ 审计（逐条回写）**不走这三个宏**（它自己跑过滤），但**受「信息」总闸控制**：
+//    信息 = false 时一条审计行都不写（`Replace::LogAudit` 第一句就返回）。
 // ⚠️ 真故障（配置读不到 / hook 失败 / MH_Init 失败）**不走宏**，始终 REX::ERROR。
 #define LOG_INFO(...)  do { if (::Config::Get().info)     { REX::INFO(__VA_ARGS__); } } while (0)
 #define LOG_ADV(...)   do { if (::Config::Get().advanced) { REX::INFO(__VA_ARGS__); } } while (0)

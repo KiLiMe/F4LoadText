@@ -40,7 +40,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # MO2 mods 目录：**本机专属路径，不写进源码**（本仓是公开的）。
 # 取值顺序：--mods-dir 参数 > 环境变量 F4LT_MODS_DIR > 仓根 .f4lt_local.json
 # 的 "mods_dir" > 报错并给出设置方法。详见 tools/local_paths.py。
-MOD_NAME = "F4LoadText"
+# ⚠️ 这是 **MO2 里那个 mod 文件夹的名字**，不是本项目的名字（2026-10-31 用户裁定）。
+#    本机装的这个 mod 是从 Nexus 发布包直接解开的，文件夹保留了发布名
+#    `F4Text - Load-Time Text Replacement`，`modlist.txt` 里启用的也只有它。
+#    以前这里写 `F4LoadText` ⇒ 部署到 `mods\F4LoadText\`，那个目录**根本没在 MO2 里启用**
+#    ⇒ 游戏一直加载旧 DLL，改了代码却“没修好”，排查了半天（日志里只有两行）。
+#    ⇒ 改名前先确认 `profiles\<配置>\modlist.txt` 里是哪个名字。
+MOD_NAME = "F4Text - Load-Time Text Replacement"
 
 # 延迟解析：命令行参数要等 argparse 跑完才知道，所以这里先占位，
 # 由 main() 里的 refresh_paths() 一次性算好。
@@ -83,12 +89,13 @@ TRANSLATIONS_SANITIZED = PROJECT_ROOT / "dist" / "translations"
 #    所以想让它入库就 `git add -f config/meta.ini` —— 有文件就照旧整份拷贝。
 META_TEMPLATE = PROJECT_ROOT / "config" / "meta.ini"
 
-# 插件 ini 模板：**每次部署都整份覆盖**目标那份（仓内 config/F4LoadText.ini 是唯一权威）。
+# 插件 ini 模板：仓内 config/F4LoadText.ini = **发布默认（静默）**。
 #
-# 为什么改成覆盖（原先是「只在不存在时拷」）：
-#   原先的写法保护了手改，但也让**新加的 ini 键永远到不了部署位** —— 代码里新增的旋钮
-#   （审计上限 / 字幕详情 / 审计签名…）在磁盘上根本看不到，只能靠默认值生效，
-#   排查时“以为 ini 里写着”就成了假前提。现在两边永远一致：要调开关就改仓内模板再部署。
+# ⚠ 部署**不覆盖**已存在的部署位（2026-10-31 用户裁定，`--force-ini` 才覆盖）：
+#   调参（Info=true / AuditText=… / AuditLimit=…）改的是 **MO2 里那份**，
+#   一次部署把它冲回模板 = “明明开了日志却一行不写”的陷阱（实际踩过两次）。
+#   代价：代码里**新增的 ini 键不会自动出现在磁盘上** —— 新键一律写成“缺省即安全”的默认，
+#   并在 `--check` 里提示；要刷模板就显式 `--force-ini`。
 CONFIG_TEMPLATE = PROJECT_ROOT / "config" / "F4LoadText.ini"
 
 # 已经废弃、要在部署目录清理掉的老文件（本版为空）。
@@ -202,7 +209,7 @@ def copy_translations(src_dir=None):
     return (n_files, n_bytes) if n_files else None
 
 
-def deploy(cfg: str, fresh: bool, sanitized: bool = False) -> int:
+def deploy(cfg: str, fresh: bool, sanitized: bool = False, force_ini: bool = False) -> int:
     print(f"═══ {MOD_NAME} 部署 ═══")
     print(f"  配置 : {cfg}")
     print(f"  目标 : {MOD_DIR}")
@@ -246,14 +253,30 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False) -> int:
     print(f"  🔒 SHA256 {src_hash[:16]}… ✓")
 
     # 配置：<游戏>\\Data\\F4SE\\Plugins\\F4LoadText.ini（与 ImeControl 同一约定）= 也就是 mod 目录里这份。
-    # **每次整份覆盖**：仓内的 config/F4LoadText.ini 是唯一权威，避免“磁盘上有新键吗”这类假前提。
+    # **默认保留现场副本**：仓内的 config/F4LoadText.ini 是唯一权威，避免“磁盘上有新键吗”这类假前提。
     ini_dest = PLUGINS_DIR / "F4LoadText.ini"
     if not CONFIG_TEMPLATE.exists():
         print(f"  ⚠️  ini 模板缺失，跳过（{CONFIG_TEMPLATE}）")
     else:
-        shutil.copy2(CONFIG_TEMPLATE, ini_dest)
-        same = ini_dest.exists() and CONFIG_TEMPLATE.read_bytes() == ini_dest.read_bytes()
-        print(f"  📋 ini   → {ini_dest}  ({ini_dest.stat().st_size:,} B，{'与模板一致' if same else '已覆盖'})")
+        # ⚠ 默认**不覆盖已存在的部署副本**（2026-10-31 用户裁定）：
+        #   仓内模板 = 发布默认（**默认静默**：Info=false / AuditLimit=0 / 审计文本空），
+        #   调参时改的是 MO2 里那份（Info=true、AuditText=… 之类），
+        #   部署一次就把现场开关冲掉 = “明明开了日志却一行不写”的经典陷阱。
+        #   要拿模板重写就显式 `--force-ini`（旧文件先备份成 .bak-<时间戳>）。
+        if ini_dest.exists() and not force_ini:
+            same = CONFIG_TEMPLATE.read_bytes() == ini_dest.read_bytes()
+            note = "与模板一致" if same else "**保留现场开关**，不覆盖"
+            print(f"  📋 ini   = {ini_dest}  ({ini_dest.stat().st_size:,} B，{note})")
+            if not same:
+                print("      ↳ 要拿模板重写：--force-ini（旧文件先备份成 .bak-<时间戳>）")
+        else:
+            if ini_dest.exists():
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                backup = ini_dest.with_name(f"F4LoadText.ini.bak-{stamp}")
+                shutil.copy2(ini_dest, backup)
+                print(f"  🗂  ini   → {backup.name}（旧副本已备份）")
+            shutil.copy2(CONFIG_TEMPLATE, ini_dest)
+            print(f"  📋 ini   → {ini_dest}  ({ini_dest.stat().st_size:,} B，已用模板覆盖)")
 
     if not write_meta():
         return 1
@@ -278,7 +301,7 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False) -> int:
     print(f"  {MOD_DIR}")
     print()
     print("  下一步：")
-    print("    1. MO2 里启用「F4LoadText」mod（已启用则跳过）")
+    print(f"    1. MO2 里启用「{MOD_NAME}」mod（已启用则跳过）")
     print("    2. 进游戏 → 读一个存档 → 进到世界 → 退出")
     print("    3. 看日志（F4SE 日志目录）：")
     print(f"       Get-Content \"$([Environment]::GetFolderPath('MyDocuments'))\\My Games\\Fallout4\\F4SE\\F4LoadText.log\"")
@@ -286,7 +309,7 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False) -> int:
     print("         + 1 行 `hook defer`（GetDescription(2193019)，由 kGameDataReady 装）")
     print("         读档完成时：`DESC map: scanned-forms=…  with-TESDescription=…`")
     print("         以及一行汇总：`replace: load-time fields  incoming-dropped=… (of which from base=…)  translated=…`")
-    print("       日志开关都在 ini（信息 / 审计上限 / 审计签名 / 高级）—— 改**仓内模板**再部署。")
+    print("       日志开关都在 ini（信息 / 审计上限 / 审计签名 / 审计文本）—— 调参改**部署位那份**，部署不会覆盖它。")
     return 0
 
 
@@ -322,7 +345,7 @@ def check(cfg: str) -> int:
         same = CONFIG_TEMPLATE.read_bytes() == d.read_bytes()
         print(f"  ini 模板 : {CONFIG_TEMPLATE}  ({CONFIG_TEMPLATE.stat().st_size:,} B)")
         print(f"  ini 部署 : {d}  ({d.stat().st_size:,} B)")
-        print(f"             {'✅ 与模板一致' if same else '⚠️  与模板不同（部署会以模板覆盖）'}")
+        print(f"             {'✅ 与模板一致' if same else 'ℹ️  与模板不同（现场调了开关；部署**不会**覆盖它，--force-ini 才覆盖）'}")
     else:
         print("  ini 模板/部署 : ❌ 缺一个（模板或部署位不存在）")
 
@@ -403,6 +426,8 @@ def main() -> int:
     p.add_argument("--force", action="store_true", help="游戏运行时也强行部署（通常没用）")
     p.add_argument("--sanitize-translations", dest="sanitized", action="store_true",
                    help="用 dist\\translations（脱敏副本，path 只剩文件名）—— 发布包用这个")
+    p.add_argument("--force-ini", dest="force_ini", action="store_true",
+                   help="用仓内模板重写已部署的 F4LoadText.ini（默认保留现场开关；旧文件先备份）")
     p.add_argument("--mods-dir", default=None,
                    help="MO2 mods 目录。默认取环境变量 F4LT_MODS_DIR，或仓根 .f4lt_local.json 的 mods_dir")
     args = p.parse_args()
@@ -435,7 +460,7 @@ def main() -> int:
     else:
         print("  ⏭️  跳过编译 (--no-build)")
 
-    return deploy(cfg, args.fresh, args.sanitized)
+    return deploy(cfg, args.fresh, args.sanitized, args.force_ini)
 
 
 if __name__ == "__main__":
