@@ -3,6 +3,10 @@ name: build
 on:
   push:
     branches: [main, master, dev]
+    # 打标签即发布：`git push --follow-tags` 之后，文末的 "Publish GitHub Release (tag)"
+    # 会用**同一个构建产物**建 Release（不需要再点 workflow_dispatch）。
+    # ⚠️ 路径过滤（paths-ignore）对 tag push 不生效 —— GitHub 的规则，所以 *.md 也不会挡住它。
+    tags: ["v*"]
     paths-ignore:
       - "**.md"
       - "LICENSE"
@@ -187,9 +191,12 @@ jobs:
       - name: Resolve package name
         shell: pwsh
         run: |
-          # zip 名：手动触发且填了 version 就用它，否则用短 sha。
+          # zip 名：tag push → 用标签名（v0.3.1）；手动触发且填了 version → 用它；否则用短 sha。
           # 用专门的步骤写 $GITHUB_ENV：step 内联赋值无法跨步骤传。
           $ver = $env:RELEASE_VERSION
+          if (-not $ver -and $env:GITHUB_REF -like 'refs/tags/*') {
+            $ver = $env:GITHUB_REF -replace '^refs/tags/', ''
+          }
           $name = if ($ver) { $ver } else { $env:GITHUB_SHA.Substring(0, 7) }
           "ZIP_NAME=F4LoadText-$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "ZIP_NAME=F4LoadText-$name.zip"
@@ -216,6 +223,19 @@ jobs:
           name: F4LoadText
           path: F4LoadText-*.zip
           if-no-files-found: error
+
+      # 打标签即发布：与上面「手动 workflow_dispatch」那条互不干扰
+      # （手动那条适合补发 / 改版说明；这条适合常规发版）。
+      # 同一个 job ⇒ 直接用 $env:ZIP_NAME，不用再 download-artifact 往返。
+      - name: Publish GitHub Release (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
 
       - name: Publish GitHub Release
         if: github.event_name == 'workflow_dispatch' && env.DO_RELEASE == 'true'
