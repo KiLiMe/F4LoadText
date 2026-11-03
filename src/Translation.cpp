@@ -376,9 +376,10 @@ std::uint32_t Translation::Load()
 	// ⚠️ 跨插件的条目**不会撞键**：键里带归属插件，覆盖记录还带 `|@来源 esp`（见下面
 	//    `BaseKey`）。所以这条规则只在「**同一个 esp** 的两份 yaml 同时在场」时起作用 ——
 	//    典型场景：换了新版 mod 的译文，旧的 yaml 忘了删。
-	//    这时**整份取胜**（输者的条目一条都不进库）：旧 yaml 里那些新版已经没有的条目
-	//    （记录被删 / 下标越界）若靠 `insert_or_assign` 混进来，运行时会按旧下标查到旧名字
-	//    —— 那才是“文本不对”的真实形态。
+	//    这时**只告警、不跳过**（用户 2026-11-03：不要退出，告警写日志就好）：两份都加载，
+	//    排序靠后的逐条覆盖同键（= `insert_or_assign` 的既有语义）。⚠️ 输者的独有条目
+	//    （旧 yaml 里新版已删除的那些）仍会进库、按旧下标查到旧名字 —— 看到 WARN 就该
+	//    去删掉旧文件，运行时不会替你做这个决定。
 	std::vector<std::filesystem::directory_entry> files;
 	for (const auto& entry : std::filesystem::directory_iterator{ dir, ec }) {
 		if (entry.is_regular_file()) {
@@ -521,31 +522,26 @@ std::uint32_t Translation::Load()
 		return a.name < b.name;
 	});
 
-	// 同一个 esp 只留排序**最后**那份；其余整份丢弃（条目一条都不进库）。
-	std::unordered_map<std::string, std::size_t> winner;   // 小写 esp → metas 下标
+	// 同一个 esp 出现多份：**只告警，照常全部加载**（排序靠后的那份逐条覆盖同键）。
+	std::unordered_map<std::string, std::size_t> latest;   // 小写 esp → metas 下标（排序最后 = 逐键赢家）
 	for (std::size_t i = 0; i < metas.size(); ++i) {
 		if (!metas[i].esp.empty()) {
-			winner[Str::LowerAscii(metas[i].esp)] = i;
+			latest[Str::LowerAscii(metas[i].esp)] = i;
 		}
 	}
-	std::vector<bool> ignored(metas.size(), false);
 	for (std::size_t i = 0; i < metas.size(); ++i) {
 		if (metas[i].esp.empty()) {
 			continue;
 		}
-		const auto it = winner.find(Str::LowerAscii(metas[i].esp));
-		if (it != winner.end() && it->second != i) {
-			ignored[i] = true;
+		const auto it = latest.find(Str::LowerAscii(metas[i].esp));
+		if (it != latest.end() && it->second != i) {
 			++stats.conflicts;
-			REX::WARN("translation: '{}' is declared by both '{}' and '{}' -> keeping the latter (the older file is fully ignored)",
-				metas[i].esp, metas[i].name, metas[it->second].name);
+			REX::WARN("translation: '{}' is declared by both '{}' and '{}' -> both loaded, '{}' wins per key; delete the stale yaml",
+				metas[i].esp, metas[i].name, metas[it->second].name, metas[it->second].name);
 		}
 	}
 
 	for (std::size_t mi = 0; mi < metas.size(); ++mi) {
-		if (ignored[mi]) {
-			continue;
-		}
 		const auto& entry = metas[mi];
 
 		YAML::Node root;

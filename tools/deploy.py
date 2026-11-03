@@ -184,8 +184,11 @@ def find_duplicate_esp(src_dir: Path) -> list[tuple[str, Path, Path]]:
     怎么看谁是“另一份”：`src/Translation.cpp` 的加载顺序是
     `priority`（大者胜）→ `generated`（ISO-8601 UTC，新者胜）→ 文件 mtime → 文件名。
 
-    ⚠️ 为什么部署前必须拦：两份并存时**不是**逐条合并，输者的条目一条都不进库；
-    但玩家看到的是“有的词翻对了、有的一直是旧的”—— 极难排查。真正的修法是删掉旧文件。
+    两份并存时**不是**逐条合并，输者的条目一条都不进库；玩家看到的是
+    “有的词翻对了、有的一直是旧的”—— 极难排查。真正的修法是删掉旧文件。
+
+    ⚠️ 只告警、**不阻断部署**（用户 2026-11-03 要求：不要退出，告警写日志就好）——
+    运行时自己会按上面的顺序整份取胜，部署侧没必要替它做决定。
     这里只读每个 yaml 的前 64 KB（`esp` 是顶层键，一定在开头）。
     """
     seen: dict[str, Path] = {}
@@ -262,12 +265,11 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False, force_ini: bool = Fal
     # 这是“换了新版译文忘了删旧文件”的典型症状，部署前拦下来（还没动任何文件）。
     dup = find_duplicate_esp(TRANSLATIONS_SANITIZED if sanitized else TRANSLATIONS_SRC)
     if dup:
-        print("  ❌ 译文源里有**同一个 esp** 的多份 yaml（运行时只留一份，其余整份丢弃）：")
+        print("  ⚠️  译文源里有**同一个 esp** 的多份 yaml（运行时只留一份，其余整份丢弃）：")
         for esp, a, b in dup:
             print(f"     {esp}: {a.name}  ⇄  {b.name}")
-        print("     → 删掉旧的那份；确实要两份并存时，把该留下的那份的 priority/generated 调高")
-        print("       （规则：priority 大者胜 → generated 新者胜 → 文件 mtime → 文件名靠后者胜）")
-        return 1
+        print("     → 建议删掉旧的那份；两份都留着时，运行时按 priority 大者胜 → generated")
+        print("       新者胜 → 文件 mtime → 文件名靠后者胜 选一份。**照常部署**")
 
     if fresh and MOD_DIR.exists():
         print("  🗑️  清空 mod 目录 (--fresh)…")
