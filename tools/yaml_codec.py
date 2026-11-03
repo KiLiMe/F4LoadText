@@ -138,3 +138,25 @@ def sort_entries(entries: list) -> list:
     """按固定顺序原地排 `entries` 并返回它（约定见 `_entry_key`）。"""
     entries.sort(key=_entry_key)
     return entries
+
+
+# ── yaml 的 `path`：只写「mod 文件夹/插件名」，不写导出机的盘符目录 ───────────
+# 运行时（src/Translation.cpp 的 ResolveEspPath → src/EspPathResolve.h 的
+# EspPath::Candidates）解析 `path` 时按 ①原样（绝对路径 / CWD 相对）②<Data>/<文件名>
+# ③<DLL>/<文件名> 依次尝试 —— **只有文件名有用**，前面的目录纯粹给人看
+# （指出这个插件来自哪个 mod 文件夹）。所以导出时抹掉导出机的盘符根。
+#
+# 例：F:\MODs_dir\Fallout 4\mods\Unofficial Fallout 4 Patch\unofficial fallout 4 patch.esp
+#  →  \Unofficial Fallout 4 Patch\unofficial fallout 4 patch.esp
+# 游戏自带 Data 根下的 CC 文件（没有 mod 文件夹）→ \ccBGSFO4115-X02.esl
+def mod_rel_path(esp_path) -> str:
+    """导出机绝对路径 → `\\<mod 文件夹>\\<插件名>`（相对 MO2 mods 根；无 mod 文件夹时只剩文件名）。"""
+    import pathlib as _pl
+
+    parts = _pl.Path(esp_path).parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].lower() == "mods":
+            rel = parts[i + 1:]
+            if rel:
+                return "\\" + "\\".join(rel)
+    return "\\" + _pl.Path(esp_path).name

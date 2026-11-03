@@ -59,7 +59,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from formid_strings_map import Plugin  # noqa: E402
-from yaml_codec import dump, sort_entries  # noqa: E402
+from yaml_codec import dump, mod_rel_path, sort_entries  # noqa: E402
 
 # 可翻译字段白名单 / 多值字段 —— 与 apply_esp_translation.py 保持一致
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -137,7 +137,8 @@ def export(esp_path: pathlib.Path, sst: dict[str, str] | None = None) -> dict:
 
     return {
         "esp": esp_path.name,
-        "path": str(esp_path),
+        # 只写「mod 文件夹\插件名」（相对 MO2 mods 根），运行时只用文件名去 <Data> 找。
+        "path": mod_rel_path(esp_path),
         "localized": bool(flags & TES4_FLAG_LOCALIZED),
         "is_light": bool(flags & TES4_FLAG_LIGHT),
         "records": pl.record_count,
