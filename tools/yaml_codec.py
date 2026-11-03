@@ -160,3 +160,21 @@ def mod_rel_path(esp_path) -> str:
             if rel:
                 return "\\" + "\\".join(rel)
     return "\\" + _pl.Path(esp_path).name
+
+def generated_stamp() -> str:
+    """生成时间 → ISO-8601 UTC（`2026-11-03T20:05:12Z`），写进 yaml 顶层的 `generated`。
+
+    为什么要有它：运行时（`src/Translation.cpp`）用
+    `priority → generated → 文件 mtime → 文件名` 决定**同一个 esp 的多份 yaml** 谁胜
+    （输者整份丢弃）。`generated` 是唯一**跟着文件走**的依据 —— 拷贝/解压/改 mtime
+    都不会动它，而 mtime 会。
+
+    `SOURCE_DATE_EPOCH`（秒）存在时用它 ⇒ 可复现构建/测试。
+    """
+    import os
+    import time
+
+    epoch = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
+    ts = int(epoch) if epoch.isdigit() else int(time.time())
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+

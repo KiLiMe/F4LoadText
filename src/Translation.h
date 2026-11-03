@@ -42,6 +42,7 @@ namespace Translation
 		std::uint32_t skippedHeader{ 0 };    // TES4 头
 		std::uint32_t skippedVariants{ 0 };  // FULL 的 INNR 多变体组（整组丢弃，见 .cpp 注释）
 		std::uint32_t duplicates{ 0 };       // 同 (键, 序号) 重复（后写的胜）
+		std::uint32_t conflicts{ 0 };        // 同一个 esp 被多份 yaml 声明 → 被整份忽略的文件数
 	};
 
 	// 扫 ini 指定的目录下的 `*.yaml` 建索引。返回收进索引的条目数（0 = 没读到/关着）。

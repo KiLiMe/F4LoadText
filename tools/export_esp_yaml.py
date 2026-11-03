@@ -59,7 +59,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from formid_strings_map import Plugin  # noqa: E402
-from yaml_codec import dump, mod_rel_path, sort_entries  # noqa: E402
+from yaml_codec import dump, generated_stamp, mod_rel_path, sort_entries  # noqa: E402
 
 # 可翻译字段白名单 / 多值字段 —— 与 apply_esp_translation.py 保持一致
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -141,6 +141,8 @@ def export(esp_path: pathlib.Path, sst: dict[str, str] | None = None) -> dict:
         "path": mod_rel_path(esp_path),
         "localized": bool(flags & TES4_FLAG_LOCALIZED),
         "is_light": bool(flags & TES4_FLAG_LIGHT),
+        # 生成时间（ISO-8601 UTC）：同一个 esp 的多份 yaml 同时在目录里时靠它判新旧。
+        "generated": generated_stamp(),
         "records": pl.record_count,
         "entries": entries,
     }

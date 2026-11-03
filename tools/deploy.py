@@ -178,6 +178,40 @@ def write_meta() -> bool:
     return True
 
 
+def find_duplicate_esp(src_dir: Path) -> list[tuple[str, Path, Path]]:
+    r"""同一个 `esp` 被多份 yaml 声明 ⇒ 运行时只留一份、另一份**整份丢弃**。
+
+    怎么看谁是“另一份”：`src/Translation.cpp` 的加载顺序是
+    `priority`（大者胜）→ `generated`（ISO-8601 UTC，新者胜）→ 文件 mtime → 文件名。
+
+    ⚠️ 为什么部署前必须拦：两份并存时**不是**逐条合并，输者的条目一条都不进库；
+    但玩家看到的是“有的词翻对了、有的一直是旧的”—— 极难排查。真正的修法是删掉旧文件。
+    这里只读每个 yaml 的前 64 KB（`esp` 是顶层键，一定在开头）。
+    """
+    seen: dict[str, Path] = {}
+    dup: list[tuple[str, Path, Path]] = []
+    for f in sorted(src_dir.glob("*.y*ml")):
+        try:
+            head = f.read_bytes()[: 64 * 1024].decode("utf-8", "replace")
+        except OSError:
+            continue
+        esp = ""
+        for line in head.splitlines():
+            if line.startswith("entries:"):
+                break
+            if line.startswith("esp:"):
+                esp = line[4:].strip().strip('"').strip("'")
+                break
+        if not esp:
+            continue  # 没 esp 的文件运行时本来就会跳过
+        key = esp.lower()
+        if key in seen:
+            dup.append((esp, seen[key], f))
+        else:
+            seen[key] = f
+    return dup
+
+
 def copy_translations(src_dir=None):
     r"""把 `translations\*.yaml` 拷进 mod（`[汉化]` 用）。
 
@@ -223,6 +257,17 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False, force_ini: bool = Fal
         print("     cmake --build build --config Release")
         return 1
     print(f"  ✅ DLL  : {dll}  ({dll.stat().st_size:,} B)")
+
+    # 译文源里同一个 esp 出现两次 ⇒ 运行时只会用其中一份（另一份整份丢弃）。
+    # 这是“换了新版译文忘了删旧文件”的典型症状，部署前拦下来（还没动任何文件）。
+    dup = find_duplicate_esp(TRANSLATIONS_SANITIZED if sanitized else TRANSLATIONS_SRC)
+    if dup:
+        print("  ❌ 译文源里有**同一个 esp** 的多份 yaml（运行时只留一份，其余整份丢弃）：")
+        for esp, a, b in dup:
+            print(f"     {esp}: {a.name}  ⇄  {b.name}")
+        print("     → 删掉旧的那份；确实要两份并存时，把该留下的那份的 priority/generated 调高")
+        print("       （规则：priority 大者胜 → generated 新者胜 → 文件 mtime → 文件名靠后者胜）")
+        return 1
 
     if fresh and MOD_DIR.exists():
         print("  🗑️  清空 mod 目录 (--fresh)…")
