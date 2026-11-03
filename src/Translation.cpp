@@ -341,9 +341,9 @@ std::uint32_t Translation::Load()
 		g_stats = a_stats;
 		g_ready.store(true, std::memory_order_relaxed);
 
-		LOG_INFO("translation: single={} multi={} (source={}; files={}; skipped header={} empty={} variant-group={} foreign={}; duplicate-key={}; conflicting-file={}) plugins={} / (plugin,chunk)={} groups, prefilted by name+chunk",
+		LOG_INFO("translation: single={} multi={} (source={}; files={}; skipped header={} empty={} variant-group={} foreign={}; duplicate-key={}) plugins={} / (plugin,chunk)={} groups, prefilted by name+chunk",
 			g_single.size(), g_multi.size(), a_src, a_stats.files, a_stats.skippedHeader,
-			a_stats.skippedEmpty, a_stats.skippedVariants, a_stats.skippedForeign, a_stats.duplicates, a_stats.conflicts,
+			a_stats.skippedEmpty, a_stats.skippedVariants, a_stats.skippedForeign, a_stats.duplicates,
 			g_pluginCount, g_pluginChunk.size());
 	};
 
@@ -369,190 +369,44 @@ std::uint32_t Translation::Load()
 	Translation::Stats     stats;
 	std::size_t            bytes_read = 0;
 
-	// ── 加载顺序 / 同 esp 冲突（2026-11-03）───────────────────────────────
-	// 优先级（大者胜）→ `generated`（ISO-8601 UTC，新者胜）→ 文件 mtime（新者胜）
-	// → 文件名（字典序**靠后者**胜，与 `insert_or_assign` 的语义一致）。
-	//
-	// ⚠️ 跨插件的条目**不会撞键**：键里带归属插件，覆盖记录还带 `|@来源 esp`（见下面
-	//    `BaseKey`）。所以这条规则只在「**同一个 esp** 的两份 yaml 同时在场」时起作用 ——
-	//    典型场景：换了新版 mod 的译文，旧的 yaml 忘了删。
-	//    这时**只告警、不跳过**（用户 2026-11-03：不要退出，告警写日志就好）：两份都加载，
-	//    排序靠后的逐条覆盖同键（= `insert_or_assign` 的既有语义）。⚠️ 输者的独有条目
-	//    （旧 yaml 里新版已删除的那些）仍会进库、按旧下标查到旧名字 —— 看到 WARN 就该
-	//    去删掉旧文件，运行时不会替你做这个决定。
+	// ⚠️ 按**文件名排序**后再加载：不同 yaml 可能给同一个键（如两个 mod 都覆盖
+	//    `Fallout4.esm` 的同一字段）不同译文 —— 目录遍历顺序是文件系统定的、不可控，
+	//    不排序的话“哪个胜”会随机器变化（且难复现）。
+	//    排序后 = 字典序**靠后**的文件胜（`insert_or_assign` 后写覆盖先写）。
 	std::vector<std::filesystem::directory_entry> files;
 	for (const auto& entry : std::filesystem::directory_iterator{ dir, ec }) {
 		if (entry.is_regular_file()) {
 			files.push_back(entry);
 		}
 	}
+	std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+		return a.path().filename().string() < b.path().filename().string();
+	});
 
-	// 判重只要三个**顶层**键，别为它把 8 MB yaml 全解析一遍：先扫每个文件的前 64 KB
-	// （我们的 header 都在开头）；扫不到 `esp` 的（手写的怪文件）才退回一次完整解析。
-	struct YamlMeta
-	{
-		std::filesystem::path path;
-		std::string           name;
-		std::string           esp;        // 原样；判重时转小写
-		long long             priority{ 0 };
-		std::string           generated;  // ISO-8601 UTC；空 = 没声明
-		long long             mtime{ 0 }; // 秒；`generated` 缺省时的第二依据
-	};
+	// 同一个 esp 出现两份 yaml = 「换新版译文忘了删旧文件」。两份**都加载**（文件名靠后的
+	// 逐键覆盖），这里只记名字、打一行 WARN —— **运行时不做丢弃/排序决策**：它不知道 esp 的
+	// 实际版本，选“哪份对”要的信息只有离线工具才有（`tools\deploy.py` 的 lint 按
+	// `generated` 点名该删哪份）。判重复用 pass 2 已经解析出来的 `esp`，零额外 I/O。
+	std::unordered_set<std::string> seenPlugins;   // 小写 esp
 
-	const auto scanHead = [](const std::filesystem::path& a_path, YamlMeta& a_meta) -> bool {
-		std::ifstream f{ a_path, std::ios::binary };
-		if (!f) {
-			return false;
-		}
-		std::string buf(64 * 1024, '\0');
-		f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-		buf.resize(static_cast<std::size_t>(f.gcount()));
-		bool        hasEsp = false;
-		std::size_t pos    = 0;
-		while (pos < buf.size()) {
-			auto eol = buf.find('\n', pos);
-			if (eol == std::string::npos) {
-				eol = buf.size();
-			}
-			std::string_view line{ buf.data() + pos, eol - pos };
-			pos = eol + 1;
-			if (!line.empty() && line.back() == '\r') {
-				line.remove_suffix(1);
-			}
-			// 只认**列 0** 的顶层键（`entries` 里的同名字段都是缩进的）
-			if (line.empty() || line[0] == ' ' || line[0] == '\t' || line[0] == '#') {
-				continue;
-			}
-			const auto sep = line.find(':');
-			if (sep == std::string_view::npos) {
-				continue;
-			}
-			const auto key = line.substr(0, sep);
-			if (key != "esp" && key != "priority" && key != "generated") {
-				continue;
-			}
-			auto val = line.substr(sep + 1);
-			while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
-				val.remove_prefix(1);
-			}
-			while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) {
-				val.remove_suffix(1);
-			}
-			const bool quoted = val.size() >= 2 &&
-				((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\''));
-			if (quoted) {
-				val.remove_prefix(1);
-				val.remove_suffix(1);
-			} else if (const auto hash = val.find(" #"); hash != std::string_view::npos) {
-				val = val.substr(0, hash);
-				while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) {
-					val.remove_suffix(1);
-				}
-			}
-			if (key == "esp") {
-				a_meta.esp = std::string{ val };
-				hasEsp     = !a_meta.esp.empty();
-			} else if (key == "priority") {
-				long long   v   = 0;
-				bool        neg = false;
-				std::size_t i   = 0;
-				if (i < val.size() && val[i] == '-') {
-					neg = true;
-					++i;
-				}
-				for (; i < val.size() && val[i] >= '0' && val[i] <= '9'; ++i) {
-					v = v * 10 + (val[i] - '0');
-				}
-				a_meta.priority = neg ? -v : v;
-			} else {
-				a_meta.generated = std::string{ val };
-			}
-		}
-		return hasEsp;
-	};
-
-	std::vector<YamlMeta> metas;
 	for (const auto& entry : files) {
+		if (!entry.is_regular_file()) {
+			continue;
+		}
 		const auto ext = Str::LowerAscii(entry.path().extension().string());
 		if (ext != ".yaml" && ext != ".yml") {
 			continue;
 		}
-		YamlMeta m;
-		m.path = entry.path();
-		m.name = entry.path().filename().string();
-		std::error_code tec;
-		const auto      ft = entry.last_write_time(tec);
-		if (!tec) {
-			const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ft);
-			m.mtime = std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count();
-		}
-		if (!scanHead(m.path, m)) {
-			// 头部 64 KB 里没有 `esp`：完整解析一次，只为拿元数据（坏的直接丢，pass 2 会再报）
-			YAML::Node probe;
-			try {
-				probe = YAML::LoadFile(m.path.string());
-			} catch (const std::exception&) {
-				continue;
-			}
-			if (!probe.IsMap() || !probe["esp"] || !probe["esp"].IsScalar()) {
-				continue;
-			}
-			m.esp       = probe["esp"].as<std::string>();
-			m.priority  = probe["priority"] ? probe["priority"].as<long long>(0) : 0;
-			m.generated = probe["generated"] ? probe["generated"].as<std::string>("") : std::string{};
-		}
-		metas.push_back(std::move(m));
-	}
-
-	std::sort(metas.begin(), metas.end(), [](const YamlMeta& a, const YamlMeta& b) {
-		if (a.priority != b.priority) {
-			return a.priority < b.priority;
-		}
-		const bool ga = !a.generated.empty();
-		const bool gb = !b.generated.empty();
-		if (ga != gb) {
-			return !ga;   // 显式声明过生成时间的胜（比文件 mtime 可信：拷贝不保留 mtime）
-		}
-		if (ga && a.generated != b.generated) {
-			return a.generated < b.generated;   // ISO-8601 UTC：字典序 == 时间序
-		}
-		if (!ga && a.mtime != b.mtime) {
-			return a.mtime < b.mtime;
-		}
-		return a.name < b.name;
-	});
-
-	// 同一个 esp 出现多份：**只告警，照常全部加载**（排序靠后的那份逐条覆盖同键）。
-	std::unordered_map<std::string, std::size_t> latest;   // 小写 esp → metas 下标（排序最后 = 逐键赢家）
-	for (std::size_t i = 0; i < metas.size(); ++i) {
-		if (!metas[i].esp.empty()) {
-			latest[Str::LowerAscii(metas[i].esp)] = i;
-		}
-	}
-	for (std::size_t i = 0; i < metas.size(); ++i) {
-		if (metas[i].esp.empty()) {
-			continue;
-		}
-		const auto it = latest.find(Str::LowerAscii(metas[i].esp));
-		if (it != latest.end() && it->second != i) {
-			++stats.conflicts;
-			REX::WARN("translation: '{}' is declared by both '{}' and '{}' -> both loaded, '{}' wins per key; delete the stale yaml",
-				metas[i].esp, metas[i].name, metas[it->second].name, metas[it->second].name);
-		}
-	}
-
-	for (std::size_t mi = 0; mi < metas.size(); ++mi) {
-		const auto& entry = metas[mi];
 
 		YAML::Node root;
 		try {
-			root = YAML::LoadFile(entry.path.string());
+			root = YAML::LoadFile(entry.path().string());
 		} catch (const std::exception& e) {
-			REX::WARN("translation: failed to parse {}: {} (file skipped)", entry.name, e.what());
+			REX::WARN("translation: failed to parse {}: {} (file skipped)", entry.path().filename().string(), e.what());
 			continue;
 		}
 		std::error_code szec;
-		bytes_read += static_cast<std::size_t>(std::filesystem::file_size(entry.path, szec));
+		bytes_read += static_cast<std::size_t>(std::filesystem::file_size(entry.path(), szec));
 		if (!root.IsMap()) {
 			continue;
 		}
@@ -561,6 +415,9 @@ std::uint32_t Translation::Load()
 			continue;
 		}
 		const auto  plugin  = pluginNode.as<std::string>();
+		if (!plugin.empty() && !seenPlugins.insert(Str::LowerAscii(plugin)).second) {
+			REX::WARN("translation: '{}' is declared by more than one yaml (both loaded; delete the stale one)", plugin);
+		}
 		const bool  isLight = root["is_light"] && root["is_light"].as<bool>(false);
 		// `path` 约定为**插件文件名**（发布包里的 yaml 不带本机目录）；
 		// 老 yaml 里的绝对路径也认（EspMastersFrom 内部会依次回退到 <Data>\、DLL 旁）。

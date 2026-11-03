@@ -141,7 +141,9 @@ def export(esp_path: pathlib.Path, sst: dict[str, str] | None = None) -> dict:
         "path": mod_rel_path(esp_path),
         "localized": bool(flags & TES4_FLAG_LOCALIZED),
         "is_light": bool(flags & TES4_FLAG_LIGHT),
-        # 生成时间（ISO-8601 UTC）：同一个 esp 的多份 yaml 同时在目录里时靠它判新旧。
+        # 上游 esp 字节数：离线 lint 用它发现「译文是为旧版本导出的」
+        "esp_size": esp_path.stat().st_size,
+        # 生成时间（ISO-8601 UTC）：同 esp 多份 yaml 时由离线 lint 用来点名删除。
         "generated": generated_stamp(),
         "records": pl.record_count,
         "entries": entries,

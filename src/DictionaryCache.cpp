@@ -58,9 +58,7 @@ namespace DictionaryCache
 	//                          所有条目 index 相同）—— 建表逻辑变了，旧缓存必须作废，
 	//                          否则被丢掉的条目会从缓存里“复活”（实测后果：武器名
 	//                          「尸鬼猎手 尸鬼猎手」/ 词被盖成 `*`）。
-	//   v7 → v8（2026-11-03）：统计里加 `conflicts`（同一个 esp 被多份 yaml 声明时被整份忽略的
-	//                          文件数），`files` 也改成实存（以前读的时候拿 stamp 个数顶 ⇒ 有忽略项时会多算）。
-	constexpr std::uint32_t kCacheVersion = 8;
+	constexpr std::uint32_t kCacheVersion = 7;
 
 	struct YamlStamp   // 一个 yaml 的“指纹”（校验用：名字 + 大小 + 修改时间）
 	{
@@ -170,15 +168,14 @@ namespace DictionaryCache
 			PutU64(out, s.size);
 			PutU64(out, static_cast<std::uint64_t>(s.mtime));
 		}
-		// v6：建表统计 —— 只为让“缓存命中”时的日志和解析路径一样可信。
-		// v8（2026-11-03）：`files` 实存（以前不存、读的时候拿 stamp 个数顶）；新增 `conflicts`。
-		PutU32(out, a_stats.files);
+		// v6：建表统计（6 个 u32）—— 只为让“缓存命中”时的日志和解析路径一样可信。
+		//   `files` 不入缓存（= 上面的 stamp 个数，读的时候直接用 n）。
 		PutU32(out, a_stats.skippedHeader);
 		PutU32(out, a_stats.skippedEmpty);
 		PutU32(out, a_stats.skippedVariants);
 		PutU32(out, a_stats.skippedForeign);
 		PutU32(out, a_stats.duplicates);
-		PutU32(out, a_stats.conflicts);
+		PutU32(out, 0);   // 保留位（以后加计数不用再 +1 版本）
 		out += body;
 
 		// 原子写：先写 .tmp 再改名（避免下次读到写了一半的缓存）
@@ -262,15 +259,14 @@ namespace DictionaryCache
 		}
 
 		// v6：建表统计（写的时候在指纹之后）—— 不读就等于让“缓存命中”的日志说谎。
-		// v8（2026-11-03）：`files` 实存、新增 `conflicts`。
 		a_stats = {};
-		a_stats.files           = r.U32();
-		a_stats.skippedHeader   = r.U32();
-		a_stats.skippedEmpty    = r.U32();
+		a_stats.files          = static_cast<std::uint32_t>(stamps.size());
+		a_stats.skippedHeader  = r.U32();
+		a_stats.skippedEmpty   = r.U32();
 		a_stats.skippedVariants = r.U32();
-		a_stats.skippedForeign  = r.U32();
-		a_stats.duplicates      = r.U32();
-		a_stats.conflicts       = r.U32();
+		a_stats.skippedForeign = r.U32();
+		a_stats.duplicates     = r.U32();
+		(void)r.U32();   // 保留位
 		if (!r.ok) {
 			return false;
 		}

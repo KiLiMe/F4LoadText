@@ -178,41 +178,106 @@ def write_meta() -> bool:
     return True
 
 
-def find_duplicate_esp(src_dir: Path) -> list[tuple[str, Path, Path]]:
-    r"""同一个 `esp` 被多份 yaml 声明 ⇒ 运行时只留一份、另一份**整份丢弃**。
+def _yaml_head(f: Path, limit: int = 64 * 1024) -> dict[str, str]:
+    r"""读 yaml 头部（到顶层 `entries:` 为止）的顶层标量键。
 
-    怎么看谁是“另一份”：`src/Translation.cpp` 的加载顺序是
-    `priority`（大者胜）→ `generated`（ISO-8601 UTC，新者胜）→ 文件 mtime → 文件名。
-
-    两份并存时**不是**逐条合并，输者的条目一条都不进库；玩家看到的是
-    “有的词翻对了、有的一直是旧的”—— 极难排查。真正的修法是删掉旧文件。
-
-    ⚠️ 只告警、**不阻断部署**（用户 2026-11-03 要求：不要退出，告警写日志就好）——
-    运行时自己会按上面的顺序整份取胜，部署侧没必要替它做决定。
-    这里只读每个 yaml 的前 64 KB（`esp` 是顶层键，一定在开头）。
+    只取 lint 要用的四个：`esp` / `path` / `esp_size` / `generated`。
+    顶层键一定在 `entries:` 之前，所以 64 KB 足够 —— 8 MB 的
+    `unofficial fallout 4 patch.yaml` 也不例外。
     """
-    seen: dict[str, Path] = {}
-    dup: list[tuple[str, Path, Path]] = []
-    for f in sorted(src_dir.glob("*.y*ml")):
-        try:
-            head = f.read_bytes()[: 64 * 1024].decode("utf-8", "replace")
-        except OSError:
+    try:
+        head = f.read_bytes()[:limit].decode("utf-8", "replace")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in head.splitlines():
+        if line.startswith("entries:"):
+            break
+        if not line or line[0] in " \t#":
             continue
-        esp = ""
-        for line in head.splitlines():
-            if line.startswith("entries:"):
-                break
-            if line.startswith("esp:"):
-                esp = line[4:].strip().strip('"').strip("'")
-                break
-        if not esp:
-            continue  # 没 esp 的文件运行时本来就会跳过
-        key = esp.lower()
-        if key in seen:
-            dup.append((esp, seen[key], f))
-        else:
-            seen[key] = f
-    return dup
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip()
+        if key in ("esp", "path", "esp_size", "generated"):
+            out[key] = val.strip().strip('"').strip("'")
+    return out
+
+
+def _resolve_esp(head: dict[str, str]) -> Path | None:
+    r"""按 yaml 的 `path` / `esp` 找磁盘上那个插件；找不到返回 None（静默跳过）。"""
+    esp = head.get("esp", "")
+    if not esp:
+        return None
+    rel = head.get("path", "") or esp
+    parts = [x for x in rel.replace("/", "\\").split("\\") if x]
+    folder = parts[0] if len(parts) > 1 else ""
+    cands: list[Path] = []
+    if folder:
+        cands.append(MODS_DIR / folder / esp)   # MO2 mod 文件夹
+    cands.append(MODS_DIR / esp)               # 文件夹被改名/扁平化
+    game_data = local_paths.local_path("game_data_dir")
+    if game_data:
+        cands.append(Path(game_data) / esp)    # 游戏自带（DLC / CC）
+    for c in cands:
+        if c.is_file():
+            return c
+    return None
+
+
+def lint_translations(src_dir: Path) -> int:
+    r"""译文源的离线质检（部署前跑，**只告警、不阻断**）。
+
+    为什么放在这里：运行时 `src/Translation.cpp` 只按**文件名**顺序加载、同一个 esp
+    出现多份时**两份都进库**（只打一行 WARN）。它不知道 esp 的实际版本，也没有
+    “哪份对”的信息 —— 那信息在离线侧：`generated`（导出时间）和 `esp_size`。
+
+    检查两件事：
+      1. 同一个 `esp` 被多份 yaml 声明 → 按 `generated` 点名该删哪份，并给出删除命令
+      2. `esp_size` 与磁盘上 esp 的实际尺寸不符 → 这份译文是为**旧版本** esp 导出的
+
+    返回告警条数（调用方只用它决定要不要打汇总行）。
+    """
+    metas: list[tuple[Path, dict[str, str]]] = []
+    for f in sorted(src_dir.glob("*.y*ml")):
+        head = _yaml_head(f)
+        if head.get("esp"):
+            metas.append((f, head))
+    if not metas:
+        return 0
+
+    warnings = 0
+    groups: dict[str, list[tuple[Path, dict[str, str]]]] = {}
+    for f, head in metas:
+        groups.setdefault(head["esp"].lower(), []).append((f, head))
+
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        warnings += 1
+        # `generated` 缺省 = 当最旧（老导出工具不写这个键）
+        items = sorted(items, key=lambda it: it[1].get("generated", ""))
+        print(f"  ⚠️  同一个 esp 有两份以上 yaml：{items[0][1]['esp']}")
+        for f, head in items[:-1]:
+            print(f"       🗑️  建议删除 {f.name}   generated={head.get('generated', '（无，按最旧）')}")
+            print(f"          Remove-Item '{f}'")
+        f, head = items[-1]
+        print(f"       ✅ 保留     {f.name}   generated={head.get('generated', '（无）')}")
+
+    for f, head in metas:
+        raw = head.get("esp_size", "")
+        if not raw.isdigit():
+            continue
+        on_disk = _resolve_esp(head)
+        if on_disk is None:
+            continue
+        size = on_disk.stat().st_size
+        if size != int(raw):
+            warnings += 1
+            print(f"  ⚠️  {f.name}：译文是为旧版本 esp 导出的")
+            print(f"       yaml esp_size={int(raw):,} B，磁盘 {on_disk.name}={size:,} B")
+            print("       → 重新导出；旧条目可能指向已删除/挪位的记录")
+    return warnings
 
 
 def copy_translations(src_dir=None):
@@ -261,15 +326,11 @@ def deploy(cfg: str, fresh: bool, sanitized: bool = False, force_ini: bool = Fal
         return 1
     print(f"  ✅ DLL  : {dll}  ({dll.stat().st_size:,} B)")
 
-    # 译文源里同一个 esp 出现两次 ⇒ 运行时只会用其中一份（另一份整份丢弃）。
-    # 这是“换了新版译文忘了删旧文件”的典型症状，部署前拦下来（还没动任何文件）。
-    dup = find_duplicate_esp(TRANSLATIONS_SANITIZED if sanitized else TRANSLATIONS_SRC)
-    if dup:
-        print("  ⚠️  译文源里有**同一个 esp** 的多份 yaml（运行时只留一份，其余整份丢弃）：")
-        for esp, a, b in dup:
-            print(f"     {esp}: {a.name}  ⇄  {b.name}")
-        print("     → 建议删掉旧的那份；两份都留着时，运行时按 priority 大者胜 → generated")
-        print("       新者胜 → 文件 mtime → 文件名靠后者胜 选一份。**照常部署**")
+    # 译文源 lint（只告警、不阻断）：同 esp 多份 yaml / 译文与 esp 版本对不上。
+    # 这些事运行时判断不了（按文件名加载、两份都进库），所以由离线侧点名。
+    n_lint = lint_translations(TRANSLATIONS_SANITIZED if sanitized else TRANSLATIONS_SRC)
+    if n_lint:
+        print(f"  ⚠️  译文源 lint：{n_lint} 条告警（不影响部署）")
 
     if fresh and MOD_DIR.exists():
         print("  🗑️  清空 mod 目录 (--fresh)…")
