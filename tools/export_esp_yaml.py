@@ -59,7 +59,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from formid_strings_map import Plugin  # noqa: E402
-from yaml_codec import dump  # noqa: E402
+from yaml_codec import dump, sort_entries  # noqa: E402
 
 # 可翻译字段白名单 / 多值字段 —— 与 apply_esp_translation.py 保持一致
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -147,6 +147,9 @@ def export(esp_path: pathlib.Path, sst: dict[str, str] | None = None) -> dict:
 
 def write_yaml(data: dict, out: pathlib.Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
+    # 条目顺序：固定 `(form_id, type, field, index)` 升序（稳定排序）——
+    # 约定在 yaml_codec.sort_entries()。
+    data["entries"] = sort_entries(data["entries"])
     out.write_text(dump(data), encoding="utf-8")
     print(f"✅ {out}  ({len(data['entries'])} 条)")
 
@@ -160,7 +163,7 @@ def write_split(data: dict, outdir: pathlib.Path) -> None:
     meta = {k: v for k, v in data.items() if k != "entries"}
     for t in sorted(bucket):
         sub = dict(meta)
-        sub["entries"] = bucket[t]
+        sub["entries"] = sort_entries(bucket[t])
         sub["_split_of"] = data["esp"]
         sub["_record_type"] = t
         p = outdir / f"{data['esp'].rsplit('.', 1)[0]}_{t}.yaml"

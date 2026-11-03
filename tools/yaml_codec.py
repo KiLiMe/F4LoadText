@@ -2,7 +2,7 @@
 # ==============================================================================
 # vendored: 上游副本 —— 来源 上游工作区 scripts/yaml_codec.py
 # 为何复制：让 F4LoadText 仓自包含，做汉化不依赖工作区上层 scripts/
-# 同步方式：手动（上游仍是权威版本）；复制日期 2026-10-10
+# 同步方式：手动（上游仍是权威版本）；复制日期 2026-10-10；2026-11-03 同步 sort_entries()
 # ==============================================================================
 
 """yaml 编辑流程 —— 三个脚本共用的一套「安全 yaml」约定。
@@ -107,3 +107,34 @@ def load(text: str):
 
 def load_file(path) -> dict:
     return load(path.read_text(encoding="utf-8"))
+
+
+# ── 条目顺序（2026-11-03 定的约定，全部导出脚本共用）───────────────────────────
+# 排序键 `(form_id, type, field, index)` 升序、**稳定排序**。
+#
+# 为什么 form_id 打头：Fallout 4 的 esp 记录本身就按 FormID 排序存盘，按它排出来的
+# 顺序与「在 esp 编辑器 / xTranslator 里翻记录」一致；mod 更新时新记录只是插在
+# 中间，diff 只显示真正变化的条目。
+# ⚠️ **不要以 type 打头**：那会把同一记录的多条（FULL + DESC）拆散到不同段，
+#    `unofficial fallout 4 patch.yaml` 实测 19,237 条会全部换位（原位 0 条）。
+#
+# 为什么**稳定**排序：同一文件里出现重复身份键时，运行时是
+# `insert_or_assign`（后写覆盖先写）—— 稳定排序保住原相对顺序 ⇒ 「谁胜」不变。
+# `ccOTMFO4001-Remnants.yaml` 有 4 个重复键（NPC_ 的 FULL#0）。
+def _entry_key(e: dict) -> tuple:
+    form_id = e.get("form_id", 0)
+    if isinstance(form_id, str):
+        s = form_id.strip()
+        form_id = int(s, 16) if s.lower().startswith("0x") else int(s or 0)
+    index = e.get("index", 0)
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        index = 0
+    return (int(form_id or 0), str(e.get("type") or ""), str(e.get("field") or ""), index)
+
+
+def sort_entries(entries: list) -> list:
+    """按固定顺序原地排 `entries` 并返回它（约定见 `_entry_key`）。"""
+    entries.sort(key=_entry_key)
+    return entries
