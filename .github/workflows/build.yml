@@ -191,15 +191,34 @@ jobs:
       - name: Resolve package name
         shell: pwsh
         run: |
-          # zip 名：tag push → 用标签名（v0.3.1）；手动触发且填了 version → 用它；否则用短 sha。
+          # zip 名（2026-11-08 起）：
+          #   tag push / 手动发版 → **固定 `F4LoadText.zip`（不带版本号）**，与本地
+          #     `tools\package_release.py` 一致；版本号只在 Release 标题/标签里。
+          #   普通 push / PR     → `F4LoadText-<短sha>.zip`（artifact 用，避免同名覆盖分不清）。
           # 用专门的步骤写 $GITHUB_ENV：step 内联赋值无法跨步骤传。
-          $ver = $env:RELEASE_VERSION
-          if (-not $ver -and $env:GITHUB_REF -like 'refs/tags/*') {
-            $ver = $env:GITHUB_REF -replace '^refs/tags/', ''
+          if ($env:GITHUB_REF -like 'refs/tags/*' -or $env:RELEASE_VERSION) {
+            $name = 'F4LoadText.zip'
+          } else {
+            $name = "F4LoadText-$($env:GITHUB_SHA.Substring(0,7)).zip"
           }
-          $name = if ($ver) { $ver } else { $env:GITHUB_SHA.Substring(0, 7) }
-          "ZIP_NAME=F4LoadText-$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "ZIP_NAME=F4LoadText-$name.zip"
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "ZIP_NAME=$name"
+
+      - name: Check tag matches PluginVersion
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          # 发版前卡一道：标签写的是版本号，DLL 里也是同一个版本号，否则 Release 名与
+          # 实际 DLL 对不上（历史上真出现过：zip 叫新的、DLL 报旧的）。
+          $src = Join-Path $env:GITHUB_WORKSPACE 'src\main.cpp'
+          $m = Select-String -Path $src -Pattern 'PluginVersion\s*\(\s*REL::Version\s*\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)'
+          if (-not $m) { throw "没能在 src/main.cpp 里找到 PluginVersion" }
+          $dllVer = ($m.Matches[0].Groups[1..3] | ForEach-Object { $_.Value }) -join '.'
+          $tagVer = ($env:GITHUB_REF -replace '^refs/tags/v?', '')
+          Write-Host "tag = $tagVer / PluginVersion = $dllVer"
+          if ($dllVer -ne $tagVer) {
+            throw "标签 $tagVer 与 src/main.cpp 的 PluginVersion $dllVer 不一致 —— 先改版本号再打标签"
+          }
 
       - name: Package zip
         shell: pwsh
@@ -221,7 +240,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: F4LoadText
-          path: F4LoadText-*.zip
+          path: F4LoadText*.zip
           if-no-files-found: error
 
       # 打标签即发布：与上面「手动 workflow_dispatch」那条互不干扰
@@ -232,7 +251,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          name: F4LoadText ${{ github.ref_name }}
           files: ${{ env.ZIP_NAME }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -242,7 +261,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
-          name: ${{ env.RELEASE_VERSION }}
+          name: F4LoadText ${{ env.RELEASE_VERSION }}
           files: ${{ env.ZIP_NAME }}
           generate_release_notes: true
           fail_on_unmatched_files: true
