@@ -2,7 +2,7 @@
 # ==============================================================================
 # 打发布包（本地，与 .github/workflows/build.yml 的 "Assemble deploy package" 同结构）
 #
-# 产物：dist\F4LoadText-<版本>.zip
+# 产物：dist\F4LoadText.zip（**不带版本号** —— 同名覆盖，下完就知道是最新的）
 #   F4SE\Plugins\F4LoadText.dll
 #   F4SE\Plugins\F4LoadText.ini
 #   F4SE\Plugins\F4LoadText\translations\README.txt   ← 只有说明，**不含 yaml**
@@ -96,7 +96,7 @@ def main() -> int:
             raise SystemExit(f"❌ 缺少 {p}")
 
     DIST.mkdir(parents=True, exist_ok=True)
-    out = DIST / f"F4LoadText-{ver}.zip"
+    out = DIST / "F4LoadText.zip"
     if out.exists():
         out.unlink()
 
@@ -107,7 +107,7 @@ def main() -> int:
         z.writestr("F4SE/Plugins/F4LoadText/translations/README.txt",
                    TRANSLATIONS_README.encode("utf-8"))
 
-    print(f"═══ 发布包 ═══")
+    print(f"═══ 发布包（版本 {ver}）═══")
     print(f"  {out}  ({out.stat().st_size:,} B)")
     with zipfile.ZipFile(out) as z:
         for info in z.infolist():
