@@ -73,6 +73,19 @@ namespace
 		return a_index < byCompile.size() ? byCompile[a_index] : std::string_view{};
 	}
 
+	// 按 **light 主文件的小块索引**（formID 的 bit12-23）反查插件名。
+	// ⚠️ 非 light 插件覆盖 light 主文件的记录时，运行时 formID 是 `0xFE | 索引<<12 | 低位`，
+	//    `ByCompileIndex(0xFE)` 查不到任何东西 ⇒ 必须走这张表（2026-11-08 修）。
+	std::string_view LightByIndex(std::uint32_t a_index)
+	{
+		auto* dh = RE::TESDataHandler::GetSingleton();
+		if (!dh) {
+			return {};
+		}
+		const auto* file = dh->LookupLoadedLightModByIndex(static_cast<std::uint16_t>(a_index & 0xFFFu));
+		return file && file->filename ? std::string_view{ file->filename } : std::string_view{};
+	}
+
 	// 这个插件名是否在本文件的主文件表（`masterPtrs`）里？
 	// 用途：③ 的双重校验 —— 反查出的拥有者**必须**是本文件声明的 master，
 	// 否则宁可拒绝（防止“反查出的插件恰好也同名但并非拥有者”这类误判）。
@@ -108,14 +121,14 @@ namespace
 		}
 		const auto hi = a_formID >> 24;
 		a_raw = hi == 0xFEu ? (a_formID & 0xFFFu) : (a_formID & 0xFFFFFFu);
-		a_owner = ByCompileIndex(hi);
+		a_owner = hi == 0xFEu ? LightByIndex((a_formID >> 12) & 0xFFFu) : ByCompileIndex(hi);
 		if (hi < a_file->masterCount && a_file->masterPtrs && a_file->masterPtrs[hi]) {
 			a_byMaster = a_file->masterPtrs[hi]->filename;
 		}
 
 		// 命中判据（两种都可能：反查结果 / 本文件主文件表）
 		const auto focus = [&](std::string_view a_plugin) {
-			return !a_plugin.empty() && Config::IsFocus(a_plugin, a_raw);
+			return !a_plugin.empty() && Config::IsFocus(a_plugin, a_raw, a_formID);
 		};
 		return focus(a_file->filename) || focus(a_owner) || focus(a_byMaster);
 	}
@@ -179,7 +192,12 @@ bool Replace::PluginAndRawIDOf(const RE::TESFile* a_file, std::uint32_t a_formID
 	const auto raw = hi == 0xFEu ? (a_formID & 0xFFFu) : (a_formID & 0xFFFFFFu);
 
 	// ① 自有记录的三种写法：轻插件已重映射 / 作者索引 = 主文件数 / 运行时编译索引
-	if (hi == 0xFEu || hi == a_file->masterCount || hi == a_file->compileIndex) {
+	// ⚠️ 不能拿 `hi == 0xFEu` 当“自有”判据（2026-11-08 修）：**非 light 插件覆盖 light 主文件的
+	//    记录**时，运行时 formID 也是 0xFE…（实测 `community fixes merged.esp` 覆盖
+	//    `ccBGSFO4096-AS_Enclave.esl` 的 OMOD = 0xFE004F9A）⇒ 会被误判成“自己的记录”，
+	//    归属查不到名单 ⇒ 覆盖文本原样保留（工作台一直显示英文的那条路）。
+	//    改用引擎自己的判据 `TESFile::IsFormInMod`（light/非 light 各自正确）。
+	if (a_file->IsFormInMod(a_formID) || hi == a_file->masterCount) {
 		a_plugin = a_file->filename;
 		a_rawID = raw;
 		return true;
@@ -417,7 +435,7 @@ void Replace::LogAudit(const char* a_leg, const RE::TESFile* a_file, std::string
 
 	// 关注记录：**命中则一路打全**（不受“真改动”门槛、上限、签名白名单限制）——
 	// 它的用途就是“不管发生了什么，先把这条记录的每一步打出来”。
-	const bool focused = Config::IsFocus(a_owner, a_rawID) || Config::IsFocus(a_file->filename, a_rawID);
+	const bool focused = Config::IsFocus(a_owner, a_rawID, formID) || Config::IsFocus(a_file->filename, a_rawID, formID);
 
 	const auto limit = cfg.auditLimit;
 	if (limit == 0 && !focused) {
@@ -497,7 +515,8 @@ bool Replace::HandleFullNameField(RE::TESFullName& a_field, const RE::TESFile* a
 	bool a_ownerRead, bool a_readerListed)
 {
 	// 关注记录：先把“到了哪一步”打出来（尤其后面被名单/归属挡下的情况）。
-	const bool focused = Config::IsFocus(a_plugin, a_rawID) || Config::IsFocus(a_file ? a_file->filename : "", a_rawID);
+	const bool focused = Config::IsFocus(a_plugin, a_rawID, a_file ? a_file->currentform.formID : 0u) ||
+	                      Config::IsFocus(a_file ? a_file->filename : "", a_rawID, a_file ? a_file->currentform.formID : 0u);
 	if (focused) {
 		LOG_ADV("focus(FULL): reader={} owner={}{} record={:#010X} raw={:#08X} listed={} reader-listed={} read-in='{}'",
 			a_file ? a_file->filename : "?",
@@ -567,7 +586,8 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 	bool a_ownerRead, bool a_readerListed)
 {
 	// 关注记录：先把“到了哪一步”打出来（尤其后面被名单/归属挡下的情况）。
-	const bool focused = Config::IsFocus(a_plugin, a_rawID) || Config::IsFocus(a_file ? a_file->filename : "", a_rawID);
+	const bool focused = Config::IsFocus(a_plugin, a_rawID, a_file ? a_file->currentform.formID : 0u) ||
+	                      Config::IsFocus(a_file ? a_file->filename : "", a_rawID, a_file ? a_file->currentform.formID : 0u);
 	if (focused) {
 		LOG_ADV("focus(String): reader={} owner={}{} record={:#010X} raw={:#08X} listed={} reader-listed={} read-in='{}'",
 			a_file ? a_file->filename : "?",

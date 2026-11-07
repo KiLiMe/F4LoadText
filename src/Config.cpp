@@ -276,12 +276,16 @@ bool Config::ShouldRewrite(std::string_view a_plugin, std::uint32_t a_rawID)
 
 // 诊断用：是否被「关注记录」指名（[调试] focusrecords）。
 // 报错也给（不看 Enable）：它只是日志开关，方便在 Enable=false 的对照实验下一起看。
-bool Config::IsFocus(std::string_view a_plugin, std::uint32_t a_rawID)
+//
+// ⚠️ 两种 ID 形态都认（2026-11-08）：插件内原始 ID（低位）**或**运行时 formID
+//    （日志里 `record=` 那一串，如 FE004F9A）。旧版只比 raw —— 按日志抄成运行时 ID
+//    的条目会静默永不命中（排“这条记录怎么没被处理”时最坑）。
+bool Config::IsFocus(std::string_view a_plugin, std::uint32_t a_rawID, std::uint32_t a_formID)
 {
 	if (a_plugin.empty() || g_focus.empty()) {
 		return false;
 	}
-	return AnyMatch(g_focus, a_plugin, a_rawID);
+	return AnyMatch(g_focus, a_plugin, a_rawID) || (a_formID != 0 && AnyMatch(g_focus, a_plugin, a_formID));
 }
 
 const std::string& Config::Path()

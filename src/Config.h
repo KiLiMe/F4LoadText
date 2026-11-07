@@ -73,8 +73,10 @@ namespace Config
 
 	// ③ 高级：诊断总闸（`高级`）—— 日志宏（LOG_ADV / LOG_ADV_W）直接读 `Get().advanced`，
 	//    不需要专门的取值函数。
-	// 诊断（`关注记录`）：这条记录是否被指名追踪（命中就一路打全，不占额度）
-	bool IsFocus(std::string_view a_plugin, std::uint32_t a_rawID);
+	// 诊断（`关注记录`）：这条记录是否被指名追踪（命中就一路打全，不占额度）。
+	// ⚠️ 两种 ID 形态都认（2026-11-08）：插件内原始 ID（低位）**或**运行时 formID
+	//    （日志里 `record=` 那一串，如 FE004F9A）—— 之前只比 raw，配成运行时 ID 就静默不命中。
+	bool IsFocus(std::string_view a_plugin, std::uint32_t a_rawID, std::uint32_t a_formID);
 }
 
 // ── 日志三类（与 ReplaceConfig 里那三个开关一一对应）──────────────────────
