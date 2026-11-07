@@ -115,7 +115,7 @@ namespace
 //    插件根本不会被加载、也不会留下任何日志。
 F4SE_PLUGIN_VERSION = []() noexcept {
 	F4SE::PluginVersionData v{};
-	v.PluginVersion(REL::Version{ 0, 3, 1, 0 });
+	v.PluginVersion(REL::Version{ 0, 3, 2, 0 });
 	v.PluginName("F4LoadText");
 	v.AuthorName("F4TC");
 	// 元数据：声明“靠什么保持跨版本兼容”，而不是“只支持哪个版本号”。
