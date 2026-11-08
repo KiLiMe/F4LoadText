@@ -58,7 +58,12 @@ namespace DictionaryCache
 	//                          所有条目 index 相同）—— 建表逻辑变了，旧缓存必须作废，
 	//                          否则被丢掉的条目会从缓存里“复活”（实测后果：武器名
 	//                          「尸鬼猎手 尸鬼猎手」/ 词被盖成 `*`）。
-	constexpr std::uint32_t kCacheVersion = 7;
+	//   v7 → v8（2026-11-08）：**建键口径变了**：light 的 yaml 不再把 raw ID 掩成 12 位
+	//                          （旧缓存里 `community fixes merged` 的 2390 条覆盖条目全是错键）。
+	//                          ⇒ 不升版会继续用坏索引，译文仍然静默缺失。
+	//   v8 → v9（2026-11-08）：v8 多存的**原文表**已删（显示层改用 `TESFile::actualChunkSize`
+	//                          按 chunk 长度定序号，不再比文本）⇒ 格式回退，必须作废 v8。
+	constexpr std::uint32_t kCacheVersion = 9;
 
 	struct YamlStamp   // 一个 yaml 的“指纹”（校验用：名字 + 大小 + 修改时间）
 	{

@@ -8,7 +8,9 @@
 #include "StrUtil.h"
 #include "Translation.h"
 
+#include <algorithm>
 #include <array>
+#include <format>
 #include <mutex>
 #include <unordered_map>
 
@@ -37,6 +39,39 @@ namespace
 	// 只用于**按数量级打点**（1/10/100/1000/10000）—— 不往 `kGameDataReady` 的汇总行里放：
 	// 那一刻界面还没开，那个数必然是 0（2026-11-08 踩过）。
 	std::atomic_uint64_t g_inlineFixed{ 0 };
+	// 显示层“定位不到第几条”的次数（长度对不上 / 等长歧义 / 读不到记录）——
+	// 这是**不写**而不是写错，但会少翻一条；汇总行里能看见，别让它默默涨。
+	std::atomic_uint64_t g_inlineUnknown{ 0 };
+
+	// 显示层定位“第几条”：`(插件, 记录, 字段) → 所有同名 chunk 的（长度, id）`。
+	//
+	// 为什么能定位（2026-11-08 实测）：`TESFile::actualChunkSize` 就是**引擎当前正在显示的那条**
+	//   chunk 的字节长度。`QUST RR201` 的 14 条 CNAM 长度 209/155/162/181/**187**/…（全不同），
+	//   界面显示第 5 条时 `actualChunkSize=187`；`QUST DLC04MQ00` 显示第 1 条时 `87`。
+	//   ⇒ 拿长度逐个比，命中唯一一个就是序号（**整数比较，不碰文本**）。
+	// ⚠️ 已证伪的两条路（别再试）：`BGSLocalizedStringDL::id` 在本 hook 上恒为 0；
+	//   `TESFile::fileoffset/formoffset` 是读盘留下的陈旧值（同一条记录的不同阶段完全相同）。
+	// 为什么要缓存：读基表要 `fopen+fseek+fread` 整条记录（RR201 是 13 KB），而这是显示层热路径。
+	//   只有**有译文**的 (插件, 字段) 才会走到这里（`HasChunk` 预筛）。
+	// ⚠️ `unordered_map` 的元素引用在 rehash 时**不失效**（节点式）⇒ 返回引用安全；本表只增不删。
+	std::mutex                                                     g_chunkMetaMutex;
+	std::unordered_map<std::string, std::vector<BaseText::ChunkEntry>> g_chunkMeta;
+
+	const std::vector<BaseText::ChunkEntry>& ChunkEntriesOf(std::string_view a_plugin,
+		std::uint32_t a_formID, std::uint32_t a_chunk4CC)
+	{
+		const std::string key = std::format("{}|{:08X}|{:08X}", Str::LowerAscii(a_plugin), a_formID, a_chunk4CC);
+		{
+			std::scoped_lock l{ g_chunkMetaMutex };
+			if (const auto it = g_chunkMeta.find(key); it != g_chunkMeta.end()) {
+				return it->second;
+			}
+		}
+		std::vector<BaseText::ChunkEntry> entries;
+		(void)BaseText::GetChunkEntries(a_plugin, a_formID, a_chunk4CC, entries);
+		std::scoped_lock l{ g_chunkMetaMutex };
+		return g_chunkMeta.emplace(key, std::move(entries)).first->second;
+	}
 }
 
 namespace
@@ -794,8 +829,7 @@ bool Replace::HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out
 		}
 		return false;
 	}
-	const char* const src = a_out.GetString();
-	if (!src || !*src) {
+	const char* const src = a_out.GetString();	if (!src || !*src) {
 		if (focus) {
 			LOG_ADV("inline-text trace: bail=empty-source");
 		}
@@ -803,10 +837,40 @@ bool Replace::HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out
 	}
 	const std::string loaded{ src };   // 临时池里的串 ⇒ 必须先拷
 
-	// ⚠️ **不占序号**：这是显示层，界面每次刷新都会来取一遍；占号会让多值字段
-	//    （QUST 一条记录里 5 条 CNAM）每刷新一次换一条 ⇒ 文本乱跳。固定 index 0
-	//    （= yaml 导出的第一条，也正是界面上显示的那句）。
-	//
+	// ① 定位「第几条」：拿 `TESFile::actualChunkSize`（引擎当前正在显示的那条 chunk 的长度）
+	//    去比从 esp 里读出的**所有同名 chunk 的长度**，命中唯一一个就是序号。
+	//    **整数比较，不碰文本**（yaml 的 `text` 改不改都不影响）。
+	// ⚠️ 已证伪的两条路（别再试）：`BGSLocalizedStringDL::id` 本 hook 上恒为 0；
+	//    `TESFile::fileoffset/formoffset` 是读盘留下的陈旧值。
+	// ⚠️ 歧义（两条 chunk 一样长）或读不到记录 ⇒ **不写**（界面保持英文）并计数，
+	//    绝不退回第 0 条 —— 那是把别的阶段的话顶上去的静默错。
+	const auto& entries = reader.empty() ? std::vector<BaseText::ChunkEntry>{}
+	                                     : ChunkEntriesOf(reader, rawID, chunkID);   // ⚠️ 传**已掩高位的 raw**（BaseText 索引就是这个口径）
+	std::size_t index = std::size_t(-1);
+	if (!entries.empty()) {
+		const auto want = a_file->actualChunkSize;
+		std::size_t hit = 0;
+		for (std::size_t i = 0; i < entries.size(); ++i) {
+			if (entries[i].size == want) {
+				if (hit == 0) {
+					index = i;
+				}
+				++hit;
+			}
+		}
+		if (hit != 1) {
+			index = std::size_t(-1);   // 0 个 = 对不上；≥2 个 = 等长歧义
+		}
+	}
+	if (index == std::size_t(-1)) {
+		g_inlineUnknown.fetch_add(1, std::memory_order_relaxed);
+		if (focus) {
+			LOG_ADV("inline-text trace: bail=index-unknown entries={} chunkSize={} chunk={} record={:#010X}",
+				entries.size(), a_file->actualChunkSize, Chunk::ChunkName(chunkID), form.formID);
+		}
+		return false;
+	}
+
 	// ⚠️ 本地化**主文件自己**的记录（2026-11-08 实测 `DLC04MQ00`「请上车」）：
 	//    引擎只肯对着**主文件**解析 id ⇒ `reader == owner`，而译文却挂在“覆盖它的那个 mod”
 	//    的键上（yaml 从那份 esp 导出 ⇒ 键带 `|@来源`）⇒ 直接查 `owner|raw|chunk` 必然 miss、
@@ -818,15 +882,18 @@ bool Replace::HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out
 			winner = files.back()->GetFilename();
 		}
 	}
+	const auto seq   = static_cast<int>(index);
 	std::string_view dest;
 	if (!winner.empty() && !Str::IEquals(plugin, winner)) {
-		dest = Translation::LookupFrom(plugin, winner, rawID, chunkID, 0);
+		dest = Translation::LookupFrom(plugin, winner, rawID, chunkID, seq);
+	}
+	if (dest.empty() && !reader.empty() && !Str::IEquals(plugin, reader)) {
+		dest = Translation::LookupFrom(plugin, reader, rawID, chunkID, seq);
 	}
 	if (dest.empty()) {
-		dest = (!reader.empty() && !Str::IEquals(plugin, reader))
-		           ? Translation::LookupFrom(plugin, reader, rawID, chunkID, 0)
-		           : Translation::Lookup(plugin, rawID, chunkID, 0);
+		dest = Translation::Lookup(plugin, rawID, chunkID, seq);   // 自有记录：键不带来源
 	}
+
 	if (dest.empty() || dest == loaded) {
 		if (focus) {
 			LOG_ADV("inline-text trace: bail={} winner={} dest='{}'",
@@ -864,12 +931,12 @@ bool Replace::HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out
 	// ⚠️ 别把这个数塞进 `kGameDataReady` 的汇总行 —— 那一刻界面还没开，必然是 0（2026-11-08 踩过）。
 	const auto n = g_inlineFixed.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000) {
-		LOG_INFO("inline(display): writes={} chunk={} reader={} owner={} record={:#010X} -- 显示层生效（逐条见 关注记录）",
-			n, chunk4, reader, plugin, form.formID);
+		LOG_INFO("inline(display): writes={} index-unknown={} chunk={} reader={} owner={} record={:#010X} -- 显示层生效（逐条见 关注记录）",
+			n, g_inlineUnknown.load(std::memory_order_relaxed), chunk4, reader, plugin, form.formID);
 	}
 	if (Config::IsFocus(plugin, rawID, form.formID) || Config::IsFocus(reader, rawID, form.formID)) {
-		LOG_ADV("focus(inline-text): chunk={} reader={} owner={} winner={} record={:#010X} read-in='{}' -> wrote '{}'",
-			chunk4, reader, plugin, winner, form.formID, OneLine(loaded), OneLine(dest));
+		LOG_ADV("focus(inline-text): chunk={} reader={} owner={} winner={} record={:#010X} index={} chunkSize={} read-in='{}' -> wrote '{}'",
+			chunk4, reader, plugin, winner, form.formID, index, a_file->actualChunkSize, OneLine(loaded), OneLine(dest));
 	}
 	return true;
 }

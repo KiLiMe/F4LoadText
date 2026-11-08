@@ -280,8 +280,8 @@ def check_prefilter() -> str:
         return v
 
     version = u32()
-    if version not in (5, 6, 7):
-        record("预筛自检", "SKIP", f"缓存版本 {version}（本脚本只认 5/6/7）")
+    if version not in (5, 6, 7, 9):
+        record("预筛自检", "SKIP", f"缓存版本 {version}（本脚本只认 5/6/7/9）")
         return "SKIP"
     for _ in range(u32()):
         rd()

@@ -403,7 +403,8 @@ static bool formIDOfDescription(const void* a_description, std::uint32_t& a_form
 
 	// 显示层（第二条，2026-11-08）：非本地化插件的内联字符串。
 	// 读盘期它们**一次都不读**（实测 QUST CNAM 只出现在 GetText 内部）⇒ 只能在这里换。
-	void* GetText_Detour(const RE::BGSLocalizedStringDL* a_self, RE::BGSLocalizedStrings::ScrapStringBuffer* a_out,
+	// `[[maybe_unused]]`：`kInlineDisplayLayer=false` 时它不被 odr-use，不标会 C4505。
+	[[maybe_unused]] void* GetText_Detour(const RE::BGSLocalizedStringDL* a_self, RE::BGSLocalizedStrings::ScrapStringBuffer* a_out,
 		RE::TESFile* a_file)
 	{
 		if (!g_getTextOriginal) {
@@ -413,6 +414,8 @@ static bool formIDOfDescription(const void* a_description, std::uint32_t& a_form
 		if (!a_out || !a_file || !Replace::Enabled()) {
 			return ret;
 		}
+		// `a_self` 不往 replace 层传：**本 hook 上它的 `id` 恒为 0**（2026-11-08 实测），
+		// 定位“第几条”：拿 `TESFile::actualChunkSize` 比基表里各条 chunk 的长度（见 `Replace.cpp`）。
 		(void)Replace::HandleInlineText(*a_out, a_file);
 		return ret;   // ⚠️ 调用方按 MSVC 约定从 rax 取返回值指针，必须原样转交
 	}
@@ -541,13 +544,22 @@ void Hooks::Install()
 	};
 	// 第 6 条腿（显示层）：非本地化插件的内联字符串 —— 靠 `BGSLocalizedStringDL::GetText` 换返回缓冲。
 	// 和 DESC 那条不同，它不需要全表单映射（`currentform` 就在 TESFile 上）⇒ 读盘期就能装。
-	g_status[5] = Status{
-		.name = "BGSLocalizedStringDL::GetText(2194238) [display layer · inline text]",
-		.id = 2194238,
-		.target = reinterpret_cast<void*>(REL::ID{ 2194238 }.address()),
-		.detour = reinterpret_cast<void*>(&GetText_Detour),
-		.original = reinterpret_cast<void**>(&g_getTextOriginal),
-	};
+	//
+	// ⚠️ **临时开关（2026-11-08，用户要求 A/B）**：先把它关掉，验证「不装这条腿时界面还变不变中文」。
+	//    `false` = 不装（日志里没有这条腿，且下面会打一行 `hook off`）。
+	//    重新打开只需要改成 `true` 重新编译 —— 代码本身一行都没删。
+	constexpr bool kInlineDisplayLayer = true;
+	if constexpr (kInlineDisplayLayer) {
+		g_status[5] = Status{
+			.name = "BGSLocalizedStringDL::GetText(2194238) [display layer · inline text]",
+			.id = 2194238,
+			.target = reinterpret_cast<void*>(REL::ID{ 2194238 }.address()),
+			.detour = reinterpret_cast<void*>(&GetText_Detour),
+			.original = reinterpret_cast<void**>(&g_getTextOriginal),
+		};
+	} else {
+		LOG_INFO("hook off    : BGSLocalizedStringDL::GetText(2194238) [display layer · inline text] -- kInlineDisplayLayer=false in src/Hooks.cpp");
+	}
 	// 第 5 条腿（临时探针）：只服务“CNAM 到底谁在读”，`高级` 关着就不装。
 	g_status[4] = Status{
 		.name = "TESFile::GetChunkData(2192538) [probe · caller RVA]",

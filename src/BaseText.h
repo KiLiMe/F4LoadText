@@ -37,10 +37,27 @@ namespace BaseText
 	// 它带的是玩家当前那份表（含汉化），所以**不需要**知道表文件在哪（MO2 虚拟目录也能对）。
 	//   a_outId = 返回的 id（成功时）
 	// 返回 false = 该记录没有这个 chunk，或它不是 4 字节 id。
+	// ⚠️ **目前没有消费者**（2026-11-08）：曾用它实现“显示层按 id 定位第几条”，
+	//    但实测 `GetText` 递进来的 `BGSLocalizedStringDL::id` 恒为 0 ⇒ 无从比对。
+	//    留着是因为它本身是对的（按 occurrence 读基表原始字节），换挂载点时可能有用。
 	[[nodiscard]] bool GetLocalizedID(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
-		std::uint32_t& a_outId);
+		std::uint32_t& a_outId, std::size_t a_occurrence = 0);
 
 	// 取chunk 的原始字节（不解析）。返回 false = 没这条记录/ 没这个 chunk。
+
+	// 一个 chunk 的**结构信息**（不拷文本）：显示层用它定位“第几条”。
+	// 见 `.cpp` 的 `GetChunkEntries`。
+	struct ChunkEntry
+	{
+		std::uint32_t size{ 0 };   // 该 chunk 的字节长度（含末尾 NUL）
+		std::uint32_t id{ 0 };     // 仅 `size == 4` 时有效：本地化字符串表 id
+	};
+
+	// 列出同一条记录里**所有**同名 chunk 的结构信息（按文件里出现的顺序）。
+	// 显示层（`GetText`）用它：引擎把当前那条的**长度**放在 `TESFile::actualChunkSize`，
+	// 拿它和这里的 `size` 逐个比 ⇒ 命中唯一一个就是“第几条”（**不碰文本**）。
+	[[nodiscard]] bool GetChunkEntries(std::string_view a_plugin, std::uint32_t a_formID,
+		std::uint32_t a_chunk4CC, std::vector<ChunkEntry>& a_out);
 	bool GetRawChunk(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
 		std::vector<std::uint8_t>& a_out);
 }

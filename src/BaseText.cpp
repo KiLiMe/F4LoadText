@@ -194,7 +194,7 @@ namespace
 		return ok;
 	}
 
-	// 读盘取 chunk 原始字节（公共路径，`Get` / `GetLocalizedID` / `GetRawChunk` 都走它）。
+	// 读盘取 chunk 原始字节（公共路径，`Get` / `GetRawChunk` 都走它）。
 	// `a_occurrence`：同一记录里第几个同名 chunk（INFO 的多句台词 = 多个 `NAM1`）。
 	bool GetRawChunkImpl(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
 		std::vector<std::uint8_t>& a_out, std::size_t a_occurrence = 0)
@@ -206,6 +206,61 @@ namespace
 		const auto [b, e] = FindCandidates(*idx, a_formID);
 		for (const auto* it = b; it != e; ++it) {
 			if (ReadChunk(a_plugin, *it, a_chunk4CC, a_occurrence, a_out)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// 列出同一条记录里**所有**同名 chunk 的（长度, id）。
+	// 显示层（`GetText`）用：引擎把当前那条的**长度**放在 `TESFile::actualChunkSize`，
+	// 拿它和这里的 `size` 比 ⇒ 命中唯一一个就是“第几条”（**不碰文本**）。
+	// 实测（2026-11-08）：`QUST RR201` 的 14 条 CNAM 长度 209/155/162/181/**187**/158/203/106/199/150/191/120/144/132，
+	//   界面显示第 5 条时 `actualChunkSize=187`；`QUST DLC04MQ00` 显示第 1 条时 `87`。
+	// ⚠️ 与 `ReadChunk` 的 `csz <= 64` 不同：这里**不限制长度**（内联文本就是 100~300 字节）。
+	bool GetChunkEntriesImpl(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
+		std::vector<BaseText::ChunkEntry>& a_out)
+	{
+		const auto* idx = EnsureIndex(std::string{ a_plugin });
+		if (!idx) {
+			return false;
+		}
+		const auto path = Paths::Plugin(a_plugin);
+		if (path.empty()) {
+			return false;
+		}
+		const auto [b, e] = FindCandidates(*idx, a_formID);
+		for (const auto* it = b; it != e; ++it) {
+			std::FILE* f = std::fopen(path.c_str(), "rb");
+			if (!f) {
+				return false;
+			}
+			std::vector<std::uint8_t> data(it->size);
+			const bool readOk = std::fseek(f, static_cast<long>(it->offset), SEEK_SET) == 0 &&
+			                    std::fread(data.data(), 1, data.size(), f) == data.size();
+			std::fclose(f);
+			if (!readOk) {
+				continue;
+			}
+			std::size_t o = 0;
+			while (o + 6 <= data.size()) {
+				const auto csig = U32(data.data() + o);
+				const auto csz  = static_cast<std::uint32_t>(data[o + 4] | (data[o + 5] << 8));
+				o += 6;
+				if (o + csz > data.size()) {
+					break;   // 截断的记录体
+				}
+				if (csig == a_chunk4CC) {
+					BaseText::ChunkEntry ent{};
+					ent.size = csz;
+					if (csz == 4) {
+						ent.id = U32(data.data() + o);
+					}
+					a_out.push_back(ent);
+				}
+				o += csz;
+			}
+			if (!a_out.empty()) {
 				return true;
 			}
 		}
@@ -249,7 +304,9 @@ namespace
 			return true;
 		};
 		const bool    tes4Ok = readTes4(r.Read(head, 24));
-		const bool    light  = (tes4Flags & 0x00000200u) != 0;   // ⚠️ 必须在 readTes4 之后算
+		// ⚠️ `light` 现在**不参与建索引**（掩码已统一成 24 位，见下面 RecordEntry 那段注释）；
+		//    留着是因为诊断时要看“这个插件是不是 ESL”，别当死代码删。
+		[[maybe_unused]] const bool light = (tes4Flags & 0x00000200u) != 0;   // ⚠️ 必须在 readTes4 之后算
 		if (tes4Ok && r.Skip(U32(head + 4))) {
 			// 顶层是隐式无界作用域：GRUP 用栈记终点；栈空只表示回到顶层，必须继续读下一个顶层组 ✓
 			std::vector<std::uint64_t> stack;
@@ -274,12 +331,21 @@ namespace
 					continue;
 				}
 				// 只留小记录（大记录没有我们要的文本 chunk ✓）；偏移必须塞得进 u32
-				if (size <= 4096 && bodyPos <= 0xFFFFFFFFull) {
+				// ⚠️ 2026-11-08 从 4096 提到 65536：显示层要读的**覆盖记录**常常很大
+				//    （实测 `community fixes merged.esp` 的 `QUST RR201` 记录体 13,102 B），
+				//    4096 的阀把它们全拦在外面 ⇒ `GetChunkEntries` 永远拿不到。
+				if (size <= 65536 && bodyPos <= 0xFFFFFFFFull) {
 					// ⚠️ **必须掩掉存储高位**：文件里自有记录的 formID 高位 = 本插件的编译索引
 					// （实测 `Fallout4.esm`=0x00、`DLCCoast.esm`=0x01、`cc*.esl`=0x01），
 					// 而所有调用方传进来的是“去高位”的插件内原始 ID ⇒ 不掩就永远查不到。
+					// ⚠️ 2026-11-08 修：**不再按 light 掩 12 位**。light 插件里的记录有两种：
+					//   自有记录（ID 在 0x000–0xFFF）与**覆盖 master 的记录**（ID 是 master 的
+					//   原始 ID，如 CFM 覆盖 `Fallout4.esm` 的 `QUST 0x000B2D48`）—— 后者掩 12 位
+					//   就变成 0xD48，查不到（实测 `bail=index-unknown entries=0`）。
+					//   统一掩 24 位：自有记录 0x01000800 / 0xFE000800 都变 0x000800（与旧行为相同），
+					//   覆盖记录 0x0B2D48 保持原样 ✓。
 					const auto stored = U32(head + 12);
-					a_index.records.push_back(RecordEntry{ light ? (stored & 0xFFFu) : (stored & 0xFFFFFFu),
+					a_index.records.push_back(RecordEntry{ stored & 0xFFFFFFu,
 						static_cast<std::uint32_t>(bodyPos), size });
 				}
 				if (!r.Skip(size)) break;
@@ -568,6 +634,14 @@ std::string_view BaseText::Get(std::string_view a_plugin, std::uint32_t a_formID
 	return cache.at(key);
 }
 
+bool BaseText::GetChunkEntries(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
+	std::vector<ChunkEntry>& a_out)
+{
+	a_out.clear();
+	std::scoped_lock l{ g_lock };
+	return GetChunkEntriesImpl(a_plugin, a_formID, a_chunk4CC, a_out);
+}
+
 bool BaseText::GetRawChunk(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
 	std::vector<std::uint8_t>& a_out)
 {
@@ -576,12 +650,12 @@ bool BaseText::GetRawChunk(std::string_view a_plugin, std::uint32_t a_formID, st
 }
 
 bool BaseText::GetLocalizedID(std::string_view a_plugin, std::uint32_t a_formID, std::uint32_t a_chunk4CC,
-	std::uint32_t& a_outId)
+	std::uint32_t& a_outId, std::size_t a_occurrence)
 {
 	std::vector<std::uint8_t> bytes;
 	{
 		std::scoped_lock l{ g_lock };
-		if (!GetRawChunkImpl(a_plugin, a_formID, a_chunk4CC, bytes)) {
+		if (!GetRawChunkImpl(a_plugin, a_formID, a_chunk4CC, bytes, a_occurrence)) {
 			return false;
 		}
 	}

@@ -45,6 +45,9 @@ namespace Replace
 	//   （实测：UFO4P 的 QUST CNAM 在 Load/Load2 里一次都不出现）。
 	//   BGSLocalizedStringDL::id 里存的是**文件内偏移**，界面来取时才由
 	//   BGSLocalizedStringDL::GetText(TESFile&) 现场按偏移读原文 ⇒ 没有“字段”可写。
+	// ⚠️ **不要试图从 `BGSLocalizedStringDL` 拿“第几条”**（2026-11-08 实测：本 hook 上它的 id 恒为 0）。
+	//   多值字段（QUST 的 15 条 CNAM）靠**引擎当前 chunk 长度**（`TESFile::actualChunkSize`）
+	//   去比基表里各条 chunk 的长度来定序号（见 `Replace.cpp` 的 `ChunkEntriesOf`）。
 	// ⚠️ 只改**这一次调用返回的缓冲**（ScrapStringBuffer），记录本身不动。
 	// ⚠️ 新串必须从**同一个 scrap heap** 分配（那个缓冲的析构器会把 ptr 还回堆）。
 	[[nodiscard]] bool HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out, const RE::TESFile* a_file);

@@ -418,7 +418,9 @@ std::uint32_t Translation::Load()
 		if (!plugin.empty() && !seenPlugins.insert(Str::LowerAscii(plugin)).second) {
 			REX::WARN("translation: '{}' is declared by more than one yaml (both loaded; delete the stale one)", plugin);
 		}
-		const bool  isLight = root["is_light"] && root["is_light"].as<bool>(false);
+		// `is_light`（yaml 头部）**不再参与建键**：2026-11-08 实测“light 就掩 12 位”会把
+		// light 插件的**覆盖记录** raw ID 全掩坏（`community fixes merged` 2390 条）——
+		// 见下面 `rawID` 处的注释。字段本身保留（导出脚本还在写）。
 		// `path` 约定为**插件文件名**（发布包里的 yaml 不带本机目录）；
 		// 老 yaml 里的绝对路径也认（EspMastersFrom 内部会依次回退到 <Data>\、DLL 旁）。
 		// 完全没有 `path` 时退到 `esp` 字段 —— 它本来就写着文件名。
@@ -480,7 +482,15 @@ std::uint32_t Translation::Load()
 						continue;
 					}
 				}
-				const auto rawID = isLight ? (formID & 0xFFFu) : (formID & 0xFFFFFFu);
+				const auto rawID = formID & 0xFFFFFFu;
+				// ⚠️ **不要按 `is_light` 掩成 12 位**（2026-11-08 修，实测 `RR201`）：
+				//    light 文件的**自有记录**本来就落在 `0x000800–0x000FFF`，掩不掩一样；
+				//    而**覆盖记录**（高位 < masters 数）的 raw ID 是完整的 24 位 —— 掩了就全错。
+				//    实测 `community fixes merged.esp`（ESL，masters=15）3002 条覆盖条目里
+				//    **2390 条**的 raw ≥ 0x1000 ⇒ 键被写成 `fallout4.esm|000D48|CNAM|@…`
+				//    （应为 `…|0B2D48|…`）⇒ 静默查不到，另有 110 处撞键。
+				//    界面指纹：`inline-text trace: … plugin=Fallout4.esm raw=0B2D48` + `bail=no-dest`。
+				//    （`DLC04MQ00`「请上车」raw=0x000800 掩了等于没掩，所以一直没暴露。）
 				const auto chunk = ChunkOf(fieldName);
 				//   覆盖记录（`owner != plugin`）带上来源 esp：同一条官方记录可能被多个 mod
 				//   覆盖，只有“正在读的那份 esp”的译文才有意义（引擎只会加载胜出的那份）。
