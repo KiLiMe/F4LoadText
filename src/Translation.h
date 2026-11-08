@@ -56,6 +56,10 @@ namespace Translation
 	int NextSeq(const RE::TESFile* a_file, std::uint32_t a_chunk4CC, std::string_view a_plugin,
 		std::uint32_t a_rawID);
 
+	// 热路径预筛：这个插件在这个 4CC 下**有没有**任何译文（无堆分配、无锁）。
+	// 显示层的 GetText 每次界面刷新都会来 ⇒ 先用它挡掉绝大多数调用，再去拷文本/建键。
+	[[nodiscard]] bool HasChunk(std::string_view a_plugin, std::uint32_t a_chunk4CC);
+
 	// 查译文（显式给序号）。命中返回非空。
 	[[nodiscard]] std::string_view Lookup(std::string_view a_plugin, std::uint32_t a_rawID,
 		std::uint32_t a_chunk4CC, int a_seq);

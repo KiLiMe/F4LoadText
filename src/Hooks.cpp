@@ -19,7 +19,8 @@
 #undef ERROR
 #undef MAX_PATH
 
-// 共 **4 个钩子**，每个都是「引擎读这段文本 / 界面来取这段文本」的**当时**改 ——
+// 共 **6 个钩子槽位**（4 条功能腿 + 1 条临时探针 + 1 条显示层 GetText），每个都是
+// 「引擎读这段文本 / 界面来取这段文本」的**当时**改 ——
 // 没有任何“启动时先扫一遍建字典、之后查表”的动作（那套本项目**没有**）。
 // 没有 vtable / Scaleform / UI 钩子。
 //
@@ -49,12 +50,33 @@ namespace
 
 	using GetDescription_t = void (*)(RE::TESDescription*, RE::BSString&, const RE::TESForm*);
 
-	LoadFullNameChunk_t g_chunkOriginal{ nullptr };
-	LoadLocString_t     g_loadLocStringOriginal{ nullptr };
-	LoadLocString_t     g_loadLocString2Original{ nullptr };
-	GetDescription_t    g_getDescriptionOriginal{ nullptr };
+	// 临时探针（2026-11-08）：QUST 的 `CNAM`（任务阶段说明）**不走** 2194235/2194240
+	// （日志实测：同一记录只看得到 FULL + NNAM）。想知道是谁读它 ⇒ 按 docs\找加载器-三步走.md
+	// 在 `TESFile::GetChunkData`（AL 2192538，成员函数 = `bool(TESFile*, void*, u32)`）里
+	// 按「关注记录」过滤 + 栈回溯取 exe 内那一帧的 RVA，再离线用 tools\al_lookup.py 反查 ID。
+	// ⚠️ 别用 `_ReturnAddress()`（落在 MinHook 的 trampoline 里）。
+	using GetChunkData_t = bool (*)(RE::TESFile*, void*, std::uint32_t);
 
-	Hooks::Status g_status[4];
+	// 显示层（2026-11-08）：`BGSLocalizedStringDL::GetText`（AL 2194238）
+	// ⚠️ 签名**不是** CommonLibF4 里声明的 `ScrapStringBuffer GetText(TESFile&)` —— 那个是错的。
+	//    两个调用点（0x6836A3 / 0x6837BA）都是 `lea rcx,[form+0x10]; lea rdx,[rsp+0x20]; mov r8,file`，
+	//    原函数 0x351B00 内部把 `[rdx+8]` 清零、把结果写进 `[rdx]` ⇒ 真实签名是
+	//    `(this /*rcx*/, ScrapStringBuffer* out /*rdx*/, TESFile* /*r8*/)`，返回 out。
+	// ⚠️ **返回值必须是 `void*` 并原样转交**（2026-11-08 闪退实测）：MSVC 从 rax 取
+	//    “隐藏返回值指针”再 `movups xmm1,[rax]` 拷 16 字节；detour 若声明成 void，rax 会被
+	//    后续调用弄成 0 ⇒ `F4LoadText.dll+0x1412F movups xmm1,[rax]` 读 0x0 崩溃。
+	using GetText_t = void* (*)(const RE::BGSLocalizedStringDL*, RE::BGSLocalizedStrings::ScrapStringBuffer*, RE::TESFile*);
+
+	LoadFullNameChunk_t   g_chunkOriginal{ nullptr };
+	LoadLocString_t       g_loadLocStringOriginal{ nullptr };
+	LoadLocString_t       g_loadLocString2Original{ nullptr };
+	GetText_t             g_getTextOriginal{ nullptr };
+	GetDescription_t    g_getDescriptionOriginal{ nullptr };
+	GetChunkData_t      g_getChunkDataOriginal{ nullptr };
+	std::atomic<int>    g_chunkProbeLines{ 0 };
+	constexpr int       kChunkProbeLimit = 60;
+
+	Hooks::Status g_status[6];
 
 	// ── “TESDescription* → formID” 映射 ─────────────────────────────
 	//
@@ -219,9 +241,15 @@ static bool formIDOfDescription(const void* a_description, std::uint32_t& a_form
 		g_descCalls.fetch_add(1, std::memory_order_relaxed);
 
 		// ① 先用形参 a_form（非空时直接用，它就是那条记录）
-		// ② a_form 实测 100% 为 nullptr ⇒ 靠**映射表**反查（唯一出路）
+		// ② a_form 多数时候是 nullptr ⇒ 靠**映射表**反查（唯一出路）
 		//    （F4TCHook 的 DescriptionHook 撞的是同一个坑：`form=00000000 type=-1`）
-		const RE::TESForm* form = a_form;
+		// ⚠️ 但 a_form **不保证是真指针**：`PipboyPerksData::DoClearData` 那条调用腿
+		//    只传 2 个参数（引擎签名第 3 个是默认 nullptr），r8 里留的是垃圾 ——
+		//    2026-11-08 实测 r8 = 0x5F ⇒ `form->sourceFiles` 读崩
+		//    （`crash-2026-11-08-02-42-51.log`：`mov rax,[rdi+8]`，rdi = 0x5F）。
+		//    ⇒ 先做**范围校验**，小整数/内核地址一律当空。
+		const auto          formAddr = reinterpret_cast<std::uintptr_t>(a_form);
+		const RE::TESForm* form = (formAddr >= 0x10000u && formAddr <= 0x00007FFF'FFFF'FFFFull) ? a_form : nullptr;
 		if (!form) {
 			std::uint32_t mappedID = 0;
 			if (formIDOfDescription(a_description, mappedID)) {
@@ -373,6 +401,64 @@ static bool formIDOfDescription(const void* a_description, std::uint32_t& a_form
 		HandleLoadedLocString(a_dst, a_file, previous);
 	}
 
+	// 显示层（第二条，2026-11-08）：非本地化插件的内联字符串。
+	// 读盘期它们**一次都不读**（实测 QUST CNAM 只出现在 GetText 内部）⇒ 只能在这里换。
+	void* GetText_Detour(const RE::BGSLocalizedStringDL* a_self, RE::BGSLocalizedStrings::ScrapStringBuffer* a_out,
+		RE::TESFile* a_file)
+	{
+		if (!g_getTextOriginal) {
+			return a_out;
+		}
+		void* const ret = g_getTextOriginal(a_self, a_out, a_file);   // 约定 1：先调原函数
+		if (!a_out || !a_file || !Replace::Enabled()) {
+			return ret;
+		}
+		(void)Replace::HandleInlineText(*a_out, a_file);
+		return ret;   // ⚠️ 调用方按 MSVC 约定从 rax 取返回值指针，必须原样转交
+	}
+
+	// 临时探针：抓「谁在读这个 chunk」。只在 `高级` 打开时安装，且只对 `关注记录` 输出。
+	bool GetChunkData_Detour(RE::TESFile* a_file, void* a_data, std::uint32_t a_size)
+	{
+		const bool ok = g_getChunkDataOriginal ? g_getChunkDataOriginal(a_file, a_data, a_size) : false;
+		const auto& cfg = Config::Get();
+		if (!a_file || !cfg.info || !cfg.advanced) {
+			return ok;
+		}
+		if (g_chunkProbeLines.load(std::memory_order_relaxed) >= kChunkProbeLimit) {
+			return ok;
+		}
+		const auto formID = a_file->currentform.formID;
+		if (!Config::IsFocus(a_file->filename, formID & 0xFFFFFFu, formID)) {
+			return ok;
+		}
+
+		const auto chunkID = static_cast<std::uint32_t>(a_file->currentchunkID.underlying());
+		char       chunk4[5]{ static_cast<char>(chunkID), static_cast<char>(chunkID >> 8),
+			                  static_cast<char>(chunkID >> 16), static_cast<char>(chunkID >> 24), 0 };
+
+		// 临时：只记 CNAM（QUST 任务描述）—— 别的 chunk 会把 60 行配额吃光
+		if (!(chunk4[0] == 'C' && chunk4[1] == 'N' && chunk4[2] == 'A' && chunk4[3] == 'M')) {
+			return ok;
+		}
+
+		void*      frames[16]{};
+		const auto depth = ::RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+		const auto base  = REX::FModule::GetExecutingModule().GetBaseAddress();
+		std::uintptr_t rva = 0;
+		for (std::uint16_t i = 0; i < depth; ++i) {
+			const auto here = reinterpret_cast<std::uintptr_t>(frames[i]) - base;
+			if (here < 0x10000000) {
+				rva = here;
+				break;
+			}
+		}
+		g_chunkProbeLines.fetch_add(1, std::memory_order_relaxed);
+		LOG_INFO("chunk probe: file={} record={:#010X} chunk={} size={} caller=RVA 0x{:X}",
+			a_file->filename, formID, chunk4, a_size, rva);
+		return ok;
+	}
+
 	void LoadFullNameChunk_Detour(RE::TESFullName* a_fullName, RE::TESFile* a_file)
 	{
 		if (!g_chunkOriginal) {
@@ -452,6 +538,24 @@ void Hooks::Install()
 		.target = reinterpret_cast<void*>(REL::ID{ 2193019 }.address()),
 		.detour = reinterpret_cast<void*>(&getDescriptionThunk),
 		.original = reinterpret_cast<void**>(&g_getDescriptionOriginal),
+	};
+	// 第 6 条腿（显示层）：非本地化插件的内联字符串 —— 靠 `BGSLocalizedStringDL::GetText` 换返回缓冲。
+	// 和 DESC 那条不同，它不需要全表单映射（`currentform` 就在 TESFile 上）⇒ 读盘期就能装。
+	g_status[5] = Status{
+		.name = "BGSLocalizedStringDL::GetText(2194238) [display layer · inline text]",
+		.id = 2194238,
+		.target = reinterpret_cast<void*>(REL::ID{ 2194238 }.address()),
+		.detour = reinterpret_cast<void*>(&GetText_Detour),
+		.original = reinterpret_cast<void**>(&g_getTextOriginal),
+	};
+	// 第 5 条腿（临时探针）：只服务“CNAM 到底谁在读”，`高级` 关着就不装。
+	g_status[4] = Status{
+		.name = "TESFile::GetChunkData(2192538) [probe · caller RVA]",
+		.id = 2192538,
+		.target = reinterpret_cast<void*>(REL::ID{ 2192538 }.address()),
+		.detour = reinterpret_cast<void*>(&GetChunkData_Detour),
+		.original = reinterpret_cast<void**>(&g_getChunkDataOriginal),
+		.disabled = !Config::Get().advanced,
 	};
 
 	for (auto& s : g_status) {

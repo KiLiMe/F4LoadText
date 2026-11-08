@@ -4,6 +4,7 @@
 
 #include "Config.h"
 #include "Paths.h"   // LOG_INFO（建索引的量体重日志走 [调试] 信息 开关）
+#include "Replace.h"  // SetSuppressInline（自己调 GetText 时不能参与替换）
 
 #include "REX/W32/KERNEL32.h"
 
@@ -461,10 +462,22 @@ namespace
 		}
 		RE::BGSLocalizedStringDL dl{};
 		dl.id = a_id;
-		// ⚠️ `ScrapStringBuffer` 是**临时池**（RAII）：不能拷贝，必须在同一个作用域里用完。
-		//    绑到 `const&&` 可把临时对象的生命周期延到本块结束。
-		const auto&& buf = dl.GetText(*const_cast<RE::TESFile*>(file));
-		const auto*  p   = buf.GetString();
+		// ⚠️ **不要**用 CommonLibF4 的 `dl.GetText(file)`（2026-11-08 实测）：
+		//    它声明成 `ScrapStringBuffer GetText(TESFile&) const`（返回值），但真实 ABI 是
+		//    `(this /*rcx*/, ScrapStringBuffer* out /*rdx*/, TESFile* /*r8*/)`、返回 out。
+		//    照错声明调，这个 **4 字节的 dl** 会被当成 out（原函数 `[out+8] = 0` ⇒ 写坏栈），
+		//    且调用方按 rax 取返回值 ⇒ 崩在 `F4LoadText.dll+0x1412F movups xmm1,[rax]`（rax=0）。
+		//    ⇒ 按真实 ABI 自己给输出缓冲（反汇编 0x351B00 / 调用点 0x6836A3 实证）。
+		using GetTextRaw_t = void* (*)(const RE::BGSLocalizedStringDL*, RE::BGSLocalizedStrings::ScrapStringBuffer*,
+			RE::TESFile*);
+		static const auto getText = reinterpret_cast<GetTextRaw_t>(REL::ID{ 2194238 }.address());
+		RE::BGSLocalizedStrings::ScrapStringBuffer buf{};   // 默认构造 = 引擎的空串哨兵；离开作用域自动还回堆
+		// ⚠️ 这里是**我们自己**在调 GetText（不是引擎在读记录）：`currentform/currentchunkID`
+		//    是上一次读盘留下的陈旧值 ⇒ 置上抑制标志，别让 GetText 钩子拿陈旧值建键。
+		Replace::SetSuppressInline(true);
+		(void)getText(&dl, &buf, const_cast<RE::TESFile*>(file));
+		Replace::SetSuppressInline(false);
+		const auto* p = buf.GetString();
 		if (!p) {
 			return true;   // 引擎答“没有文本” ⇒ 这是权威答案
 		}

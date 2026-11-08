@@ -33,6 +33,10 @@ namespace
 	//    若将来引擎改成并行读盘，这里要换 atomic。
 	Replace::Stats    g_stats;
 	std::atomic<bool> g_on{ false };
+	// 显示层（GetText）的计数单独放：它每次界面刷新都可能再算一次，不能混进读盘期统计。
+	// 只用于**按数量级打点**（1/10/100/1000/10000）—— 不往 `kGameDataReady` 的汇总行里放：
+	// 那一刻界面还没开，那个数必然是 0（2026-11-08 踩过）。
+	std::atomic_uint64_t g_inlineFixed{ 0 };
 }
 
 namespace
@@ -203,7 +207,16 @@ bool Replace::PluginAndRawIDOf(const RE::TESFile* a_file, std::uint32_t a_formID
 		return true;
 	}
 	// ② 引擎已按**本文件的空间**把这条表单建好了 → 自有（覆盖记录不会出现这条）
-	if (RE::TESForm::GetFormByID(OwnRuntimeID(a_file, raw))) {
+	// ⚠️ 判据必须是「拼出来的 ID **就是这条记录的** ID」，不能是「这个 ID 上有表单、而且是我定义的」
+	//    （2026-11-08 实测 `DLC04MQ00`「请上车」，`unofficial fallout 4 patch.esp` 覆盖 DLCNukaWorld 的 `0x000800`）：
+	//      · UFO4P 的 masters 有 16 个、运行时编译索引 = 7（7 个官方 ESM 之后，CC 全是 light 不占号）；
+	//      · 它自己有一条 FLST `0x10000800`（文件内编号）⇒ 运行时 `0x07000800`；
+	//      · `OwnRuntimeID(UFO4P, 0x000800)` 恰好也 = `0x07000800` ⇒ `GetFormByID` 拿到的是**那条 FLST**，
+	//        而它确实是 UFO4P 自己定义的（`sourceFiles.front()` 也救不了）⇒ 误判成自有
+	//        ⇒ 查 `unofficial fallout 4 patch.esp|000800|CNAM` 必然 miss ⇒ 界面一直英文。
+	//    日志指纹：`inline-text trace: resolved=true plugin=unofficial fallout 4 patch.esp raw=000800` + `bail=no-translation-for-chunk`。
+	//    ⚠️ 读盘期同一份数据是好的 —— 那时那条 FLST 还没建好，`GetFormByID` 返回空 ⇒ 落到 ③ 才判对。
+	if (const auto ownID = OwnRuntimeID(a_file, raw); ownID == a_formID) {
 		a_plugin = a_file->filename;
 		a_rawID = raw;
 		return true;
@@ -588,9 +601,14 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 	// 关注记录：先把“到了哪一步”打出来（尤其后面被名单/归属挡下的情况）。
 	const bool focused = Config::IsFocus(a_plugin, a_rawID, a_file ? a_file->currentform.formID : 0u) ||
 	                      Config::IsFocus(a_file ? a_file->filename : "", a_rawID, a_file ? a_file->currentform.formID : 0u);
+	// 这条腿是**通用**的（`ChunkID(a_file)`），一条记录里可能连着来好几个字符串字段
+	// （QUST = FULL + 5×CNAM + 4×NNAM）⇒ 日志必须带 chunk 4CC，否则分不出是哪一条。
+	const auto chunkID = ChunkID(a_file);
+	char       chunk4[5]{ static_cast<char>(chunkID), static_cast<char>(chunkID >> 8),
+		                  static_cast<char>(chunkID >> 16), static_cast<char>(chunkID >> 24), 0 };
 	if (focused) {
-		LOG_ADV("focus(String): reader={} owner={}{} record={:#010X} raw={:#08X} listed={} reader-listed={} read-in='{}'",
-			a_file ? a_file->filename : "?",
+		LOG_ADV("focus(String): chunk={} reader={} owner={}{} record={:#010X} raw={:#08X} listed={} reader-listed={} read-in='{}'",
+			chunk4, a_file ? a_file->filename : "?",
 			a_plugin.empty() ? "?" : a_plugin.data(), a_ownerRead ? " (is itself)" : " (override)",
 			a_file ? a_file->currentform.formID : 0, static_cast<std::uint64_t>(a_rawID),
 			IsListed(a_plugin, a_rawID), a_readerListed, OneLine(a_loaded));
@@ -599,7 +617,7 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 	// ⚠️ **每次调用只占一次号，且在函数入口**（2026-10-31）：下面有“命中译文直接 return”的分支，
 	//    那些分支不占号 ⇒ 同一记录里后续 `NAM1` 的 seq 整体**左移一位** ⇒ 第 2 句拿到第 1 句的基表文本
 	//    （“字幕总是同一句”的第二条成因）。
-	const int seq = NextSeq(a_file, ChunkID(a_file), a_plugin, a_rawID);
+	const int seq = NextSeq(a_file, chunkID, a_plugin, a_rawID);
 
 	// ── yaml 译文（`[汉化]`）——优先级高于基底（用户 2026-10-08 裁定）
 	//
@@ -609,7 +627,10 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 	//    `!ownerRead` 且命中译文 ⇒ 先写 yaml 译文（yaml > 基底 > 引擎原值）。
 	// ⚠️ 必须在 `RememberOwnText` **之前**返回：写了译文就不该再把英文记进“基底备料”。
 	if (Translation::Ready() && !a_plugin.empty()) {
-		const auto dest = Translation::LookupChunk(a_file, a_plugin, a_rawID, ChunkID(a_file), a_loaded);
+		const auto dest = Translation::LookupChunk(a_file, a_plugin, a_rawID, chunkID, a_loaded);
+		if (focused) {
+			LOG_ADV("focus(String): yaml {} chunk={} dest='{}'", dest.empty() ? "MISS" : "HIT", chunk4, OneLine(dest));
+		}
 		if (!dest.empty()) {
 			AssignText(a_field, dest);
 			++g_stats.fieldTranslated;
@@ -704,6 +725,151 @@ bool Replace::HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TE
 			++g_stats.fieldIgnored;
 			LogAudit("String", a_file, a_plugin, a_rawID, a_loaded, keep);
 		}
+	}
+	return true;
+}
+
+// ── 已撤回（2026-11-08）：2194238 不是“内联文本腿”──────────────────────
+//
+// 我曾把 AL 2194238（RVA 0x351B00）当成 `BGSLocalizedString::Load` 的内联分支，
+// 按 `(字段, std::string*, TESFile*)` 去钩、直接改那个 std::string。**错的**：
+// 反汇编原函数（0x351B00）看到的是
+//   351b27  mov r15, rcx        ; arg1 = this（BGSLocalizedStringDL*）
+//   351b3b  mov rdi, rdx        ; arg2 = **输出缓冲**（16 字节）
+//   351b5b  mov [rdi+8], r12    ; ★ 先把 arg2+8 清零
+//   351bb7  mov r15d, [r14+0x2b8]; lea rcx,[rbp-0x30]; call 0x1657ac0 …
+// ⇒ arg2 是 `BGSLocalizedStrings::ScrapStringBuffer`（`{ptr, offset}` 16 字节），
+//   不是 std::string；把它当 std::string 读写会踩坏调用方的栈。
+// 而且 `IDs.h` 里 2194238 = `BGSLocalizedStringDL::GetText`（本项目 `BaseText::ResolveViaEngine`
+// 天天在调它）。这条腿已整体删除。
+//
+// 教训：**签名必须先用调用点反汇编验证**，不能从“看起来像”推。
+
+// ── 显示层（第二条，2026-11-08）：非本地化插件的**内联**字符串 ──────────────────
+//
+// 背景（实测日志，记录 0X000A8BAF = UFO4P 的「记忆中断」）：
+//   · Fallout4.esm（localized）的 QUST CNAM：读盘期 size=4 caller=RVA 0x351ADB
+//     ⇒ 2194237 把 4 字节 stringID 塞进字段，之后按 id 查表。
+//   · unofficial fallout 4 patch.esp（localized=false）的同一条 CNAM：
+//     size=0 caller=RVA 0x351C0F ⇒ **在 2194238 GetText 内部**才读，
+//     字段里存的是文件内偏移 ⇒ 没有“读盘期”可写。
+// ⇒ 唯一能改的时机 = 界面来取文本的这一下，且只能换它拿到的缓冲。
+namespace
+{
+	// 自己（`BaseText::ResolveViaEngine`）调 GetText 时置上 ⇒ 那条路不参与替换
+	//（它不在“正在读某条记录”的上下文里，`currentform/currentchunkID` 是陈旧值）。
+	thread_local bool g_suppressInline = false;
+}
+
+void Replace::SetSuppressInline(bool a_on)
+{
+	g_suppressInline = a_on;
+}
+
+bool Replace::HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out, const RE::TESFile* a_file)
+{
+	if (g_suppressInline || !g_on.load(std::memory_order_relaxed) || !a_file || !Translation::Ready()) {
+		return false;
+	}
+	const auto&      form = a_file->currentform;
+	std::string_view plugin;
+	std::uint32_t    rawID = 0;
+	const bool       resolved = PluginAndRawIDOf(a_file, form.formID, plugin, rawID);
+	const auto       reader = a_file->filename ? std::string_view{ a_file->filename } : std::string_view{};
+	const auto       chunkID = ChunkID(a_file);
+	// 关注记录：把每一次判定都记下来（“为什么没写”比“写了什么”更重要 —— 本项目最贵的 bug 都是静默的）。
+	const bool focus = Config::IsFocus(plugin, rawID, form.formID) || Config::IsFocus(reader, rawID, form.formID);
+	if (focus) {
+		LOG_ADV("inline-text trace: resolved={} plugin={} raw={:06X} reader={} chunk={} record={:#010X}",
+			resolved, plugin, rawID, reader, Chunk::ChunkName(chunkID), form.formID);
+	}
+	if (!resolved || plugin.empty()) {
+		return false;
+	}
+	// ⚠️ 热路径预筛**必须在拷文本之前**：GetText 是显示层热路径（界面每刷新一次就来一遍），
+	//    先按 (插件, 4CC) 挡掉没有译文的绝大多数调用，省掉每次一次 std::string 分配。
+	if (!Translation::HasChunk(plugin, chunkID)) {
+		if (focus) {
+			LOG_ADV("inline-text trace: bail=no-translation-for-chunk");
+		}
+		return false;
+	}
+	const char* const src = a_out.GetString();
+	if (!src || !*src) {
+		if (focus) {
+			LOG_ADV("inline-text trace: bail=empty-source");
+		}
+		return false;
+	}
+	const std::string loaded{ src };   // 临时池里的串 ⇒ 必须先拷
+
+	// ⚠️ **不占序号**：这是显示层，界面每次刷新都会来取一遍；占号会让多值字段
+	//    （QUST 一条记录里 5 条 CNAM）每刷新一次换一条 ⇒ 文本乱跳。固定 index 0
+	//    （= yaml 导出的第一条，也正是界面上显示的那句）。
+	//
+	// ⚠️ 本地化**主文件自己**的记录（2026-11-08 实测 `DLC04MQ00`「请上车」）：
+	//    引擎只肯对着**主文件**解析 id ⇒ `reader == owner`，而译文却挂在“覆盖它的那个 mod”
+	//    的键上（yaml 从那份 esp 导出 ⇒ 键带 `|@来源`）⇒ 直接查 `owner|raw|chunk` 必然 miss、
+	//    界面保持英文。⇒ 先试**胜出覆盖者**（`sourceFiles.back()`，与 DESC 层同一口径）。
+	std::string_view winner;
+	if (const auto* f = RE::TESForm::GetFormByID(form.formID); f && f->sourceFiles.array) {
+		const auto& files = *f->sourceFiles.array;
+		if (!files.empty() && files.back()) {
+			winner = files.back()->GetFilename();
+		}
+	}
+	std::string_view dest;
+	if (!winner.empty() && !Str::IEquals(plugin, winner)) {
+		dest = Translation::LookupFrom(plugin, winner, rawID, chunkID, 0);
+	}
+	if (dest.empty()) {
+		dest = (!reader.empty() && !Str::IEquals(plugin, reader))
+		           ? Translation::LookupFrom(plugin, reader, rawID, chunkID, 0)
+		           : Translation::Lookup(plugin, rawID, chunkID, 0);
+	}
+	if (dest.empty() || dest == loaded) {
+		if (focus) {
+			LOG_ADV("inline-text trace: bail={} winner={} dest='{}'",
+				dest.empty() ? "no-dest" : "same-as-loaded", winner, OneLine(dest));
+		}
+		return false;
+	}
+
+	// 从**同一个 scrap heap** 分配 —— 引擎的 AutoScrapBuffer::Allocate(0x1657AF0) 就是
+	// GetThreadScrapHeap()->Allocate(size, 8)；而 ScrapStringBuffer 的析构器会把这个
+	// ptr 还给同一个堆 ⇒ 指向静态串会在析构时 free 错指针（崩）。
+	auto* const heap = RE::MemoryManager::GetSingleton().GetThreadScrapHeap();
+	if (!heap) {
+		return false;
+	}
+	void* const mem = heap->Allocate(dest.size() + 1, 8);
+	if (!mem) {
+		return false;
+	}
+	std::memcpy(mem, dest.data(), dest.size());
+	static_cast<char*>(mem)[dest.size()] = '\0';
+
+	// 换指针，旧串交给引擎自己的析构器（引擎在 GetText 末尾也是「换掉 → 析构临时」，
+	// 见 0x351C5A..0x351C74）。
+	RE::MemoryManager::AutoScrapBuffer old{};
+	old.ptr = a_out.buffer.ptr;
+	a_out.buffer.ptr = mem;
+	a_out.offset = 0;
+
+	char chunk4[5]{ static_cast<char>(chunkID), static_cast<char>(chunkID >> 8),
+		static_cast<char>(chunkID >> 16), static_cast<char>(chunkID >> 24), 0 };
+
+	// 显示层是热路径（界面每刷新一次就可能来一遍）⇒ 计数只按**数量级**打点：
+	// 1 / 10 / 100 / 1000 / 10000 各一行（有界，且能看出这次会话到底换了多少）。
+	// ⚠️ 别把这个数塞进 `kGameDataReady` 的汇总行 —— 那一刻界面还没开，必然是 0（2026-11-08 踩过）。
+	const auto n = g_inlineFixed.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000) {
+		LOG_INFO("inline(display): writes={} chunk={} reader={} owner={} record={:#010X} -- 显示层生效（逐条见 关注记录）",
+			n, chunk4, reader, plugin, form.formID);
+	}
+	if (Config::IsFocus(plugin, rawID, form.formID) || Config::IsFocus(reader, rawID, form.formID)) {
+		LOG_ADV("focus(inline-text): chunk={} reader={} owner={} winner={} record={:#010X} read-in='{}' -> wrote '{}'",
+			chunk4, reader, plugin, winner, form.formID, OneLine(loaded), OneLine(dest));
 	}
 	return true;
 }

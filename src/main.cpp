@@ -79,6 +79,8 @@ namespace
 
 			if (Replace::Enabled()) {
 				const auto r = Replace::Snapshot();
+				// ⚠️ 这里**不**打显示层（`GetText`）的次数：kGameDataReady 那一刻界面还没开，必然是 0
+				//    （2026-11-08 踩过）。显示层自己在 `Replace::HandleInlineText` 里按数量级打点。
 				LOG_INFO("replace: load-time fields  incoming-dropped={} (of which from base={})  translated={}  -- overrides from plugins outside the whitelist are discarded, base text is kept",
 					r.fieldIgnored, r.fieldFromBase, r.fieldTranslated);
 			}
@@ -115,7 +117,7 @@ namespace
 //    插件根本不会被加载、也不会留下任何日志。
 F4SE_PLUGIN_VERSION = []() noexcept {
 	F4SE::PluginVersionData v{};
-	v.PluginVersion(REL::Version{ 0, 3, 2, 0 });
+	v.PluginVersion(REL::Version{ 0, 3, 3, 0 });
 	v.PluginName("F4LoadText");
 	v.AuthorName("F4TC");
 	// 元数据：声明“靠什么保持跨版本兼容”，而不是“只支持哪个版本号”。

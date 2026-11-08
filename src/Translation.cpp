@@ -677,6 +677,11 @@ int Translation::NextSeq(const RE::TESFile* a_file, std::uint32_t a_chunk4CC, st
 	return seq++;
 }
 
+bool Translation::HasChunk(std::string_view a_plugin, std::uint32_t a_chunk4CC)
+{
+	return g_ready.load(std::memory_order_relaxed) && HasTranslation(a_plugin, a_chunk4CC);
+}
+
 std::string_view Translation::Lookup(std::string_view a_plugin, std::uint32_t a_rawID,
 	std::uint32_t a_chunk4CC, int a_seq)
 {

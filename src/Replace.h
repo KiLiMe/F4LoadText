@@ -2,10 +2,8 @@
 
 #include <cstdint>
 
-namespace RE
-{
-	class BGSLocalizedString;
-}
+#include "RE/B/BGSLocalizedString.h"
+
 #include <string>
 #include <string_view>
 
@@ -22,6 +20,8 @@ namespace Replace
 		std::uint64_t fieldIgnored{ 0 };   // 「忽略文本传入」数（保住基底文本）
 		std::uint64_t fieldFromBase{ 0 };  // 其中靠"自取基表文本"救回来的（引擎没读基表那份）
 		std::uint64_t fieldTranslated{ 0 };  // 靠 yaml 译文写回的（`[汉化]`，见 Translation.h）
+		// 显示层（GetText）的计数**不在这里**：它在 `kGameDataReady` 时必然为 0（界面还没开），
+		// 由 `Replace::HandleInlineText` 自己按数量级打点（1/10/100/1000/10000）。
 	};
 
 	void             Init();                                  // Config::Load 之后调用
@@ -39,6 +39,21 @@ namespace Replace
 	[[nodiscard]] bool HandleLocalizedField(RE::BGSLocalizedString& a_field, const RE::TESFile* a_file,
 		std::uint32_t a_formCode, std::string_view a_plugin, std::uint32_t a_rawID, std::string_view a_previous,
 		std::string_view a_loaded, bool a_ownerRead, bool a_readerListed);
+
+	// ── 显示层（第二条，2026-11-08）：非本地化插件的**内联**字符串 ──────────────
+	// 为什么必须在这里：localized=false 的插件，读盘期**一个字节都不读**这些字段
+	//   （实测：UFO4P 的 QUST CNAM 在 Load/Load2 里一次都不出现）。
+	//   BGSLocalizedStringDL::id 里存的是**文件内偏移**，界面来取时才由
+	//   BGSLocalizedStringDL::GetText(TESFile&) 现场按偏移读原文 ⇒ 没有“字段”可写。
+	// ⚠️ 只改**这一次调用返回的缓冲**（ScrapStringBuffer），记录本身不动。
+	// ⚠️ 新串必须从**同一个 scrap heap** 分配（那个缓冲的析构器会把 ptr 还回堆）。
+	[[nodiscard]] bool HandleInlineText(RE::BGSLocalizedStrings::ScrapStringBuffer& a_out, const RE::TESFile* a_file);
+
+	// 显示层（GetText）：**我们自己**（`BaseText::ResolveViaEngine`）也会调 GetText。
+	// 那种调用不在“正在读某条记录”的上下文里 —— `TESFile::currentform / currentchunkID`
+	// 还是上一次读盘留下的**陈旧值**，拿它建键可能命中别的记录的译文（写错文本）。
+	// ⇒ 自己调 GetText 时置上，`HandleInlineText` 看到就直接返回。
+	void SetSuppressInline(bool a_on);
 
 	// 逐条审计（文本日志）：仅**真改动**时打（a_read != a_kept）。
 	// 上限由 ini 的 [调试] 审计上限 控制（0 = 关，默认 300）。

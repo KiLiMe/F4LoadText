@@ -1,6 +1,6 @@
 {
 	"name": "f4loadtext",
-	"version-string": "0.3.2",
+	"version-string": "0.3.3",
 	"description": "F4LoadText 依赖清单。本地构建默认走仓内已解包的 build/vcpkg_installed（不联网）；CI 走 vcpkg manifest 模式按 builtin-baseline 安装。",
 	"supports": "windows & x64",
 	"builtin-baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
